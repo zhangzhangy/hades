@@ -227,6 +227,19 @@ ETCD_TLSPEM to the *public* key of the client.
 	we query the domain cctv1.user.hades.local form hades we get the ip 192.168.10.3, then we shut down the servic, we query the domain again
 	we get the ip 192.168.10.1.
 
+##Performance Test
+
+###Testing Conditions
+####Physical hardware
+    NIC: gigabit ethernet card
+ 	CPUs: 32
+	RAM: 32G
+	OS: CentOS-7.2
+####Testing Software
+    queryperf
+
+###Test result
+   ![image](https://github.com/ipdcode/hades/blob/master/images/DNS_performance.png)
 
 ## Future
 
