@@ -16,7 +16,11 @@ import (
 	"github.com/ipdcode/hades/cache"
 	"github.com/ipdcode/hades/msg"
 	"github.com/golang/glog"
+	"fmt"
+	"math"
 )
+
+const Version = "1.1.1"
 
 type server struct {
 	backend Backend
@@ -102,7 +106,7 @@ func New(backend Backend, config *Config) *server {
 		config:  config,
 
 		group:        new(sync.WaitGroup),
-		rcache:       cache.New(config.RCache, config.RCacheTtl),
+		rcache:       cache.New(config.RCache, config.RCacheTtl,config.RCacheFlush,config.RadomOne),
 		dnsUDPclient: &dns.Client{Net: "udp", ReadTimeout: config.ReadTimeout, WriteTimeout: config.ReadTimeout, SingleInflight: true},
 		dnsTCPclient: &dns.Client{Net: "tcp", ReadTimeout: config.ReadTimeout, WriteTimeout: config.ReadTimeout, SingleInflight: true},
 		ipMonitorPath : config.IpMonitorPath,
@@ -278,7 +282,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	m.Compress = true
 	bufsize := uint16(512)
 	tcp := false
-	start := time.Now()
+	timeNow := time.Now().UTC()
 
 	q := req.Question[0]
 	name := strings.ToLower(q.Name)
@@ -292,7 +296,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		// if write fails don't care
 		w.WriteMsg(m)
 
-		promErrorCount.WithLabelValues("refused").Inc()
+		statsErrorCountRefused ++
 		return
 	}
 
@@ -302,22 +306,25 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// with TCP we can send 64K
 	if tcp = isTCP(w); tcp {
 		bufsize = dns.MaxMsgSize - 1
-		promRequestCount.WithLabelValues("tcp").Inc()
+		statsRequestCountTcp++
 	} else {
-		promRequestCount.WithLabelValues("udp").Inc()
+		statsRequestCountUdp++
 	}
+
+	statsRequestCount++
+
 
 	glog.V(2).Infof("received DNS Request for %q from %q with type %d", q.Name, w.RemoteAddr(), q.Qtype)
 
 	// Check cache first.
 	remoteAddr := w.RemoteAddr().String() //10.8.65.158:42158
 	remoteIp := strings.Split(remoteAddr, ":")
-	m1 := s.rcache.Search(q, tcp, m.Id,remoteIp[0])
+	m1 := s.rcache.Search(q, tcp, m.Id,remoteIp[0],timeNow)
 	if m1 != nil {
 		glog.V(4).Infof("cache hit %q: %v\n ", q.Name,m1.Answer)
 		if tcp {
 			if _, overflow := Fit(m1, dns.MaxMsgSize, tcp); overflow {
-				promErrorCount.WithLabelValues("overflow").Inc()
+				statsErrorCountOverflow ++
 				msgFail := new(dns.Msg)
 				s.ServerFailure(msgFail, req)
 				w.WriteMsg(msgFail)
@@ -327,14 +334,21 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			// Overflow with udp always results in TC.
 			Fit(m1, int(bufsize), tcp)
 			if m1.Truncated {
-				promErrorCount.WithLabelValues("truncated").Inc()
+				statsErrorCountTruncated++
 			}
 		}
 
 		if err := w.WriteMsg(m1); err != nil {
 			glog.Infof("failure to return reply %q", err)
 		}
-		metricSizeAndDuration(m1, start, tcp)
+		return
+	}
+	if q.Qtype == dns.TypePTR && strings.HasSuffix(name, ".in-addr.arpa.") || strings.HasSuffix(name, ".ip6.arpa.") {
+		resp := s.ServeDNSReverse(w, req)
+		if resp != nil {
+			s.rcache.InsertMessage(cache.Key(q, tcp), resp,remoteIp[0],timeNow)
+	
+		}
 		return
 	}
 
@@ -342,13 +356,12 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		resp := s.ServeDNSForward(w, req)
 		glog.V(4).Infof("ServeDNSForward %q: %v \n ", q.Name, resp.Answer)
 		if resp != nil {
-			s.rcache.InsertMessage(cache.Key(q, tcp), resp,remoteIp[0])
-			metricSizeAndDuration(resp, start, tcp)
+			s.rcache.InsertMessage(cache.Key(q, tcp), resp,remoteIp[0],timeNow)
+	
 		}
 		return
 	}
-
-	promCacheMiss.WithLabelValues("response").Inc()
+        statsCacheMissResponse++
 
 	defer func() {
 		glog.V(4).Infof("get  %q: %v \n ", q.Name, m.Answer)
@@ -383,27 +396,98 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		} else {
 			Fit(m, int(bufsize), tcp)
 			if m.Truncated {
-				promErrorCount.WithLabelValues("truncated").Inc()
+				statsErrorCountTruncated++
 			}
 		}
-		s.rcache.InsertMessage(cache.Key(q, tcp), m,remoteIp[0])
+		s.rcache.InsertMessage(cache.Key(q, tcp), m,remoteIp[0],timeNow)
 
 		if err := w.WriteMsg(m); err != nil {
 			glog.Infof("failure to return reply %q", err)
 		}
-		metricSizeAndDuration(m, start, tcp)
+
 	}()
 
 	if q.Qclass == dns.ClassCHAOS {
-	       // not support
+		if q.Qtype == dns.TypeTXT {
+			switch name {
+			case "authors.bind.":
+				fallthrough
+			case s.config.Domain:
+				hdr := dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassCHAOS, Ttl: 0}
+				authors := []string{"Chensg", "Li Guochao","Yang Wanli"}
+				for _, a := range authors {
+					m.Answer = append(m.Answer, &dns.TXT{Hdr: hdr, Txt: []string{a}})
+				}
+				for j := 0; j < len(authors)*(int(dns.Id())%4+1); j++ {
+					q := int(dns.Id()) % len(authors)
+					p := int(dns.Id()) % len(authors)
+					if q == p {
+						p = (p + 1) % len(authors)
+					}
+					m.Answer[q], m.Answer[p] = m.Answer[p], m.Answer[q]
+				}
+				return
+			case "version.bind.":
+				fallthrough
+			case "version.server.":
+				hdr := dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassCHAOS, Ttl: 0}
+				m.Answer = []dns.RR{&dns.TXT{Hdr: hdr, Txt: []string{Version}}}
+				return
+			case "hostname.bind.":
+				fallthrough
+			case "id.server.":
+				// TODO(miek): machine name to return
+				hdr := dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassCHAOS, Ttl: 0}
+				m.Answer = []dns.RR{&dns.TXT{Hdr: hdr, Txt: []string{"localhost"}}}
+				return
+			}
+		}
+		// still here, fail
 		m.SetReply(req)
 		m.SetRcode(req, dns.RcodeServerFailure)
 		return
 	}
 
 	switch q.Qtype {
+	case dns.TypeNS:
+		if name != s.config.Domain {
+			break
+		}
+		// Lookup s.config.DnsDomain
+		records, extra, err := s.NSRecordsBind9Record(q, s.config.dnsDomain)
+		if isEtcdNameError(err, s) {
+			s.NameError(m, req)
+			return
+		}
+		m.Answer = append(m.Answer, records...)
+		m.Extra = append(m.Extra, extra...)
 	case dns.TypeA, dns.TypeAAAA:
-		records, err := s.AddressRecords(q, name, nil, bufsize, false)
+		// domain name return bind9 type
+		if name == s.config.Domain {
+			ns, extra, _ := s.NSRecordsBind9Record(q, s.config.dnsDomain)
+			m.Ns = append(m.Ns, ns...)
+			m.Extra = append(m.Extra, extra...)
+                        dnsIpname := "dns-ip.dns." +s.config.Domain
+
+			records, err := s.AddressRecords(q, dnsIpname, nil, bufsize, false)
+			if isEtcdNameError(err, s) {
+				s.NameError(m, req)
+				return
+			}
+			m.Answer = append(m.Answer, records...)
+
+		}else{
+			records, err := s.AddressRecords(q, name, nil, bufsize, false)
+			if isEtcdNameError(err, s) {
+				s.NameError(m, req)
+				return
+			}
+			m.Answer = append(m.Answer, records...)
+
+		}
+
+	case dns.TypeTXT:
+		records, err := s.TXTRecords(q, name)
 		if isEtcdNameError(err, s) {
 			s.NameError(m, req)
 			return
@@ -416,12 +500,41 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		}
 		m.Answer = append(m.Answer, records...)
-
+	case dns.TypeMX:
+		records, extra, err := s.MXRecords(q, name, bufsize)
+		if isEtcdNameError(err, s) {
+			s.NameError(m, req)
+			return
+		}
+		m.Answer = append(m.Answer, records...)
+		m.Extra = append(m.Extra, extra...)
 	default:
-		 glog.Infof("err, the type %s, we ignore, q name=%s\n", q.Qtype,q.Name)
+		fallthrough // also catch other types, so that they return NODATA
+	case dns.TypeSRV:
+		records, extra, err := s.SRVRecords(q, name, bufsize)
+		if err != nil {
+			if isEtcdNameError(err, s) {
+				s.NameError(m, req)
+				return
+			}
+			glog.Infof("got error from backend: %s", err)
+			if q.Qtype == dns.TypeSRV { // Otherwise NODATA
+				s.ServerFailure(m, req)
+				return
+			}
+		}
+		// if we are here again, check the types, because an answer may only
+		// be given for SRV. All other types should return NODATA, the
+		// NXDOMAIN part is handled in the above code. TODO(miek): yes this
+		// can be done in a more elegant manor.
+		if q.Qtype == dns.TypeSRV {
+			m.Answer = append(m.Answer, records...)
+			m.Extra = append(m.Extra, extra...)
+		}
 	}
 
 	if len(m.Answer) == 0 { // NODATA response
+		statsNoDataCount++
 		m.Ns = []dns.RR{s.NewSOA()}
 		m.Ns[0].Header().Ttl = s.config.MinTtl
 	}
@@ -437,6 +550,9 @@ func (s *server) AddressRecords(q dns.Question, name string, previousRecords []d
 	services = msg.Group(services)
 
 	for _, serv := range services {
+		if serv.Host == ""{
+			continue
+		}
 		ip := net.ParseIP(serv.Host)
 		switch {
 		case ip == nil:
@@ -491,6 +607,207 @@ func (s *server) AddressRecords(q dns.Question, name string, previousRecords []d
 	return records, nil
 }
 
+// NSRecords returns NS records from etcd.
+func (s *server) NSRecords(q dns.Question, name string) (records []dns.RR, extra []dns.RR, err error) {
+	services, err := s.backend.Records(name, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	services = msg.Group(services)
+
+	for _, serv := range services {
+		ip := net.ParseIP(serv.Host)
+		switch {
+		case ip == nil:
+			return nil, nil, fmt.Errorf("NS record must be an IP address")
+		case ip.To4() != nil:
+			serv.Host = msg.Domain(serv.Key)
+			records = append(records, serv.NewNS(q.Name, serv.Host))
+			extra = append(extra, serv.NewA(serv.Host, ip.To4()))
+		case ip.To4() == nil:
+			serv.Host = msg.Domain(serv.Key)
+			records = append(records, serv.NewNS(q.Name, serv.Host))
+			extra = append(extra, serv.NewAAAA(serv.Host, ip.To16()))
+		}
+	}
+	return records, extra, nil
+}
+
+// NSRecords returns NS records from etcd.
+func (s *server) NSRecordsBind9Record(q dns.Question, name string) (records []dns.RR, extra []dns.RR, err error) {
+	services, err := s.backend.Records(name, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	services = msg.Group(services)
+
+	for _, serv := range services {
+		ip := net.ParseIP(serv.Host)
+		switch {
+		case ip == nil:
+			return nil, nil, fmt.Errorf("NS record must be an IP address")
+		case ip.To4() != nil:
+			domain := msg.Domain(serv.Key)
+			domain = strings.Replace(domain, "ns.dns." ,"" ,1)
+			serv.Host = domain
+			records = append(records, serv.NewNS(q.Name, serv.Host))
+			extra = append(extra, serv.NewA(serv.Host, ip.To4()))
+		case ip.To4() == nil:
+			domain := msg.Domain(serv.Key)
+			domain = strings.Replace(domain, "ns.dns." ,"" ,1)
+			serv.Host = domain
+			records = append(records, serv.NewNS(q.Name, serv.Host))
+			extra = append(extra, serv.NewAAAA(serv.Host, ip.To16()))
+		}
+	}
+	return records, extra, nil
+}
+// SRVRecords returns SRV records from etcd.
+// If the Target is not a name but an IP address, a name is created.
+func (s *server) SRVRecords(q dns.Question, name string, bufsize uint16) (records []dns.RR, extra []dns.RR, err error) {
+	services, err := s.backend.Records(name, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	services = msg.Group(services)
+
+	// Looping twice to get the right weight vs priority
+	w := make(map[int]int)
+	for _, serv := range services {
+		weight := 100
+		if serv.Weight != 0 {
+			weight = serv.Weight
+		}
+		if _, ok := w[serv.Priority]; !ok {
+			w[serv.Priority] = weight
+			continue
+		}
+		w[serv.Priority] += weight
+	}
+	lookup := make(map[string]bool)
+	for _, serv := range services {
+		w1 := 100.0 / float64(w[serv.Priority])
+		if serv.Weight == 0 {
+			w1 *= 100
+		} else {
+			w1 *= float64(serv.Weight)
+		}
+		weight := uint16(math.Floor(w1))
+		ip := net.ParseIP(serv.Host)
+		switch {
+		case ip == nil:
+			srv := serv.NewSRV(q.Name, weight)
+			records = append(records, srv)
+
+			if _, ok := lookup[srv.Target]; ok {
+				break
+			}
+
+			lookup[srv.Target] = true
+
+			if !dns.IsSubDomain(s.config.Domain, srv.Target) {
+				m1, e1 := s.Lookup(srv.Target, dns.TypeA, bufsize)
+				if e1 == nil {
+					extra = append(extra, m1.Answer...)
+				}
+				m1, e1 = s.Lookup(srv.Target, dns.TypeAAAA, bufsize)
+				if e1 == nil {
+					// If we have seen CNAME's we *assume* that they are already added.
+					for _, a := range m1.Answer {
+						if _, ok := a.(*dns.CNAME); !ok {
+							extra = append(extra, a)
+						}
+					}
+				}
+				break
+			}
+			// Internal name, we should have some info on them, either v4 or v6
+			// Clients expect a complete answer, because we are a recursor in their
+			// view.
+			addr, e1 := s.AddressRecords(dns.Question{srv.Target, dns.ClassINET, dns.TypeA},
+				srv.Target, nil, bufsize, true)
+			if e1 == nil {
+				extra = append(extra, addr...)
+			}
+		case ip.To4() != nil:
+			serv.Host = msg.Domain(serv.Key)
+			srv := serv.NewSRV(q.Name, weight)
+
+			records = append(records, srv)
+			extra = append(extra, serv.NewA(srv.Target, ip.To4()))
+		case ip.To4() == nil:
+			serv.Host = msg.Domain(serv.Key)
+			srv := serv.NewSRV(q.Name, weight)
+
+			records = append(records, srv)
+			extra = append(extra, serv.NewAAAA(srv.Target, ip.To16()))
+		}
+	}
+	return records, extra, nil
+}
+
+// MXRecords returns MX records from etcd.
+// If the Target is not a name but an IP address, a name is created.
+func (s *server) MXRecords(q dns.Question, name string, bufsize uint16) (records []dns.RR, extra []dns.RR, err error) {
+	services, err := s.backend.Records(name, false)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	lookup := make(map[string]bool)
+	for _, serv := range services {
+		if !serv.Mail {
+			continue
+		}
+		ip := net.ParseIP(serv.Host)
+		switch {
+		case ip == nil:
+			mx := serv.NewMX(q.Name)
+			records = append(records, mx)
+			if _, ok := lookup[mx.Mx]; ok {
+				break
+			}
+
+			lookup[mx.Mx] = true
+
+			if !dns.IsSubDomain(s.config.Domain, mx.Mx) {
+				m1, e1 := s.Lookup(mx.Mx, dns.TypeA, bufsize)
+				if e1 == nil {
+					extra = append(extra, m1.Answer...)
+				}
+				m1, e1 = s.Lookup(mx.Mx, dns.TypeAAAA, bufsize)
+				if e1 == nil {
+					// If we have seen CNAME's we *assume* that they are already added.
+					for _, a := range m1.Answer {
+						if _, ok := a.(*dns.CNAME); !ok {
+							extra = append(extra, a)
+						}
+					}
+				}
+				break
+			}
+			// Internal name
+			addr, e1 := s.AddressRecords(dns.Question{mx.Mx, dns.ClassINET, dns.TypeA},
+				mx.Mx, nil, bufsize, true)
+			if e1 == nil {
+				extra = append(extra, addr...)
+			}
+		case ip.To4() != nil:
+			serv.Host = msg.Domain(serv.Key)
+			records = append(records, serv.NewMX(q.Name))
+			extra = append(extra, serv.NewA(serv.Host, ip.To4()))
+		case ip.To4() == nil:
+			serv.Host = msg.Domain(serv.Key)
+			records = append(records, serv.NewMX(q.Name))
+			extra = append(extra, serv.NewAAAA(serv.Host, ip.To16()))
+		}
+	}
+	return records, extra, nil
+}
+
 func (s *server) CNAMERecords(q dns.Question, name string) (records []dns.RR, err error) {
 	services, err := s.backend.Records(name, true)
 	if err != nil {
@@ -508,11 +825,39 @@ func (s *server) CNAMERecords(q dns.Question, name string) (records []dns.RR, er
 	return records, nil
 }
 
+func (s *server) TXTRecords(q dns.Question, name string) (records []dns.RR, err error) {
+	services, err := s.backend.Records(name, false)
+	if err != nil {
+		return nil, err
+	}
+
+	services = msg.Group(services)
+
+	for _, serv := range services {
+		if serv.Text == "" {
+			continue
+		}
+		records = append(records, serv.NewTXT(q.Name))
+	}
+	return records, nil
+}
+
+func (s *server) PTRRecords(q dns.Question) (records []dns.RR, err error) {
+	name := strings.ToLower(q.Name)
+	serv, err := s.backend.ReverseRecord(name)
+	if err != nil {
+		return nil, err
+	}
+
+	records = append(records, serv.NewPTR(q.Name, serv.Ttl))
+	return records, nil
+}
+
 // SOA returns a SOA record for this HADES instance.
 func (s *server) NewSOA() dns.RR {
 	return &dns.SOA{Hdr: dns.RR_Header{Name: s.config.Domain, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: s.config.Ttl},
-		Ns:      appendDomain("ns.dns", s.config.Domain),
-		Mbox:    "none",
+		Ns:      appendDomain("ns1", s.config.Domain),
+		Mbox:     s.config.hostMaster,
 		Serial:  uint32(time.Now().Truncate(time.Hour).Unix()),
 		Refresh: 28800,
 		Retry:   7200,
@@ -536,19 +881,20 @@ func (s *server) NameError(m, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeNameError)
 	m.Ns = []dns.RR{s.NewSOA()}
 	m.Ns[0].Header().Ttl = s.config.MinTtl
-	promErrorCount.WithLabelValues("nxdomain")
+	statsErrorCountNoname++
 }
 
 func (s *server) NoDataError(m, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeSuccess)
 	m.Ns = []dns.RR{s.NewSOA()}
 	m.Ns[0].Header().Ttl = s.config.MinTtl
-	promErrorCount.WithLabelValues("nodata")
+	statsNoDataCount++
+
 }
 
 func (s *server) ServerFailure(m, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeServerFailure)
-	promErrorCount.WithLabelValues("servfail")
+	statsErrorCountServfail++
 }
 
 func (s *server) dedup(m *dns.Msg) *dns.Msg {

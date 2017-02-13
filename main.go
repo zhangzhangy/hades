@@ -22,7 +22,6 @@ import (
 const (
 	glogFlushPeriod       = 5 * time.Second
 	syncIpStatusPeriod    = 60 * time.Second
-	HadesVersion          = "1.0.1"
 )
 var (
 	tlskey     = ""
@@ -33,12 +32,14 @@ var (
 	machine    = ""
 	version    = false
 
+	statsServer     = ""
+	statsServerAuthToken     = ""
+
 )
 
 func init() {
 	flag.StringVar(&config.Domain, "domain",  "hades.local.", "domain to anchor requests")
 	flag.StringVar(&config.DnsAddr, "addr",  "127.0.0.1:53", "ip:port mode , the addr to be bind)")
-	flag.StringVar(&config.MetricsPort, "metrics-port",  "", "the metrics port")
 
 	flag.StringVar(&config.IpMonitorPath, "ip-monitor-path", "/hades/monitor/status/", "the ips to check available")
 	flag.StringVar(&nameserver, "nameservers", "", "nameserver address(es) to forward (non-local) queries to e.g. 8.8.8.8:53,8.8.4.4:53")
@@ -51,6 +52,11 @@ func init() {
 
 	flag.IntVar(&config.RCache, "rcache", server.RCacheCapacity, "capacity of the response cache")
 	flag.IntVar(&config.RCacheTtl, "rcache-ttl", server.RCacheTtl, "TTL of the response cache")
+	flag.StringVar(&statsServer, "statsServer",  "", "hades stats data server like 127.0.0.1:9600")
+	flag.StringVar(&statsServerAuthToken, "statsServerAuthToken",  "@hades.com", "hades stats data server token")
+        flag.BoolVar(&config.RadomOne, "radom-one", false, "piack radom one result for A")
+
+	flag.IntVar(&config.RCacheFlush, "rcache-flush", server.RCacheFlush, "the duration to flush expired cache out")
 }
 
 func glogFlush(period time.Duration) {
@@ -61,7 +67,7 @@ func glogFlush(period time.Duration) {
 func main() {
 	flag.Parse()
 	if version{
-		fmt.Printf("%s\n",HadesVersion)
+		fmt.Printf("%s\n",server.Version)
 		return
 	}
 	go glogFlush(glogFlushPeriod)
@@ -115,7 +121,6 @@ func main() {
 		}
 	}()
 
-	server.Metrics(config.MetricsPort)
 
         // watch ip status
 	go func() {
@@ -144,6 +149,8 @@ func main() {
 	s.SyncHadesHostStatus()
 
 	go s.HostStatusSync(syncIpStatusPeriod)
+
+	go s.Statistics(statsServer,statsServerAuthToken) //
 
 	if err := s.Run(); err != nil {
 		glog.Fatalf("hades: %s", err)

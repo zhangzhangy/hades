@@ -14,6 +14,7 @@ import (
 const (
 	RCacheCapacity = 100000
 	RCacheTtl      = 60
+	RCacheFlush    = 30
 )
 
 // Config provides options to the HADES resolver.
@@ -43,8 +44,12 @@ type Config struct {
 
 	// How many labels a name should have before we allow forwarding. Default to 2.
 	Ndots int `json:"ndot,omitempty"`
-
+	RadomOne bool `json:"radom-one,omitempty"`
 	MetricsPort string `json:"metrics_port,omitempty"`
+        dnsDomain   string // "ns.dns". + config.Domain
+	hostMaster   string // "ns.dns". + config.Domain
+	// RCacheTtl, how long to cache in seconds.
+	RCacheFlush int `json:"rcache_flush,omitempty"`
 }
 
 func SetDefaults(config *Config) error {
@@ -72,6 +77,9 @@ func SetDefaults(config *Config) error {
 	if config.RCacheTtl == 0 {
 		config.RCacheTtl = RCacheTtl
 	}
+	if config.RCacheFlush == 0 {
+		config.RCacheTtl = RCacheFlush
+	}
 	if config.Ndots <= 0 {
 		config.Ndots = 2
 	}
@@ -88,7 +96,8 @@ func SetDefaults(config *Config) error {
 		}
 	}
 	config.Domain = dns.Fqdn(strings.ToLower(config.Domain))
-
+        config.dnsDomain = appendDomain("ns.dns", config.Domain)
+ 	config.hostMaster = "hostmaster@"+  config.Domain
 	return nil
 }
 

@@ -12,7 +12,7 @@ import (
 
 // ServeDNSForward forwards a request to a nameservers and returns the response.
 func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
-	promExternalRequestCount.WithLabelValues("recursive").Inc()
+	statsForwardCount++
 
 	if len(s.config.Nameservers) == 0 || dns.CountLabel(req.Question[0].Name) < s.config.Ndots {
 
@@ -68,11 +68,30 @@ Redo:
 	w.WriteMsg(m)
 	return m
 }
+// ServeDNSReverse is the handler for DNS requests for the reverse zone. If nothing is found
+// locally the request is forwarded to the forwarder for resolution.
+func (s *server) ServeDNSReverse(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Compress = true
+	m.Authoritative = false // Set to false, because I don't know what to do wrt DNSSEC.
+	m.RecursionAvailable = true
+	var err error
+	if m.Answer, err = s.PTRRecords(req.Question[0]); err == nil {
+		// TODO(miek): Reverse DNSSEC. We should sign this, but requires a key....and more
+		// Probably not worth the hassle?
+		if err := w.WriteMsg(m); err != nil {
+			glog.Infof("failure to return reply %q", err)
+		}
+		return m
+	}
+	// Always forward if not found locally.
+	return s.ServeDNSForward(w, req)
+}
 
 // Lookup looks up name,type using the recursive nameserver defines
 // in the server's config. If none defined it returns an error.
 func (s *server) Lookup(n string, t, bufsize uint16) (*dns.Msg, error) {
-	promExternalRequestCount.WithLabelValues("lookup").Inc()
 
 	if len(s.config.Nameservers) == 0 {
 		return nil, fmt.Errorf("no nameservers configured can not lookup name")

@@ -11,7 +11,7 @@ import (
 	"hash/fnv"
 	"runtime"
 	"os"
-	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -50,7 +50,7 @@ var(
 	gConfig *ConfigOps
 	configFile =""
 	version   = false
-	floatintIpPotrs map[string][]string
+	monitorIpPotrs map[string][]string
 )
 
 type GeneralOps struct {
@@ -92,6 +92,7 @@ type kube2hades struct {
 	etcdMutationTimeout time.Duration
 	// A cache that contains all the services in the system.
 	servicesStore kcache.Store
+	endpointsStore kcache.Store
 
 	// Lock for controlling access to headless services.
 	mlock sync.Mutex
@@ -194,7 +195,7 @@ func (ks *kube2hades) writeIpMonitorRecord(ip string, ports []string) error {
 	res,err := ks.etcdClient.Get(key, false, true)
 	// the key exist
 	if err == nil{
-		glog.V(2).Infof(" writeIpMonitorRecord key:%s exist,val: res.Node.Value:%s",res.Node.Value)
+		glog.V(2).Infof(" writeIpMonitorRecord key:%s exist,val: res.Node.Value:%s",key,res.Node.Value)
 		return nil
 	}
 	//set
@@ -211,21 +212,47 @@ func (ks *kube2hades) writeIpMonitorRecord(ip string, ports []string) error {
 	}
 	return err
 }
-func getHadesMsg(ip string, port int) *hadesmsg.Service {
+func getHadesMsg(ip string, port int, dnstype string) *hadesmsg.Service {
 	return &hadesmsg.Service{
 		Host:     ip,
 		Port:     port,
 		Priority: 10,
 		Weight:   10,
 		Ttl:      30,
-		Dnstype:  "A",
+		Dnstype:  dnstype,
 	}
 }
 
-func (ks *kube2hades) generateRecordsForPortalService(subdomain string, service *kapi.Service) error {
+func buildPortSegmentString(portName string, portProtocol kapi.Protocol) string {
+	if portName == "" {
+		// we don't create a random name
+		return ""
+	}
 
-	ip := service.Status.LoadBalancer.Ingress[0].IP
-	b, err := json.Marshal(getHadesMsg(ip, 0))
+	if portProtocol == "" {
+		glog.Errorf("Port Protocol not set. port segment string cannot be created.")
+		return ""
+	}
+
+	return fmt.Sprintf("_%s._%s", portName, strings.ToLower(string(portProtocol)))
+}
+
+func (ks *kube2hades) generateSRVRecord(subdomain, portSegment, recordName, cName string, portNumber int32) error {
+	recordKey := buildDNSNameString(subdomain, portSegment, recordName)
+	srv_rec, err := json.Marshal(getHadesMsg(cName, int(portNumber),"SRV"))
+	if err != nil {
+		return err
+	}
+	glog.Infof(" srv recordKey =%s\n",recordKey)
+	if err := ks.writeHadesRecord(recordKey, string(srv_rec)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ks *kube2hades) generateOneRecordForPortalService(subdomain string, ip string, service *kapi.Service) error {
+
+	b, err := json.Marshal(getHadesMsg(ip, 0,"A"))
 	if err != nil {
 		return err
 	}
@@ -243,25 +270,26 @@ func (ks *kube2hades) generateRecordsForPortalService(subdomain string, service 
 		ports = append(ports, fmt.Sprintf("%d", port.Port) )
 	}
 	ks.writeIpMonitorRecord(ip,ports)
+	return nil
+}
+func (ks *kube2hades) generateRecordsForPortalService(subdomain string, service *kapi.Service) error {
 
+	for _, ip := range(service.Spec.ExternalIPs){
+		ks.generateOneRecordForPortalService(subdomain,ip,service)
+	}
 	return nil
 }
 
 func (ks *kube2hades)IsServiceVIPSet(service *kapi.Service) bool{
-	if len(service.Status.LoadBalancer.Ingress) == 0  || service.Status.LoadBalancer.Ingress[0].IP == ""{
+	if len(service.Spec.ExternalIPs) == 0  || service.Spec.ExternalIPs[0] == ""{
 		return false
 	}
-	// check the ip addr
-	glog.V(4).Infof("service lb vip: %s\n", service.Status.LoadBalancer.Ingress[0].IP)
-	isIp := net.ParseIP(service.Status.LoadBalancer.Ingress[0].IP)
-	return isIp != nil
+	return true
 }
 
 func (ks *kube2hades)IsServiceVIPDiff(oldsvc *kapi.Service,newsvc *kapi.Service) bool{
-
-	glog.V(4).Infof(" old: %+v new = %+v\n",oldsvc,newsvc)
-	i := len(oldsvc.Status.LoadBalancer.Ingress)
-	j := len(newsvc.Status.LoadBalancer.Ingress)
+	i := len(oldsvc.Spec.ExternalIPs)
+	j := len(newsvc.Spec.ExternalIPs)
 	if  i != j {
 		return true
 	}
@@ -269,13 +297,23 @@ func (ks *kube2hades)IsServiceVIPDiff(oldsvc *kapi.Service,newsvc *kapi.Service)
 	if i ==0{
 		return false
 	}
-	return oldsvc.Status.LoadBalancer.Ingress[0].IP != newsvc.Status.LoadBalancer.Ingress[0].IP
+	if reflect.DeepEqual(oldsvc.Spec.ExternalIPs, newsvc.Spec.ExternalIPs){
+		return false
+	}
+	return true
 }
 
+func (ks *kube2hades) isServiceSrv(service *kapi.Service) bool {
+	return service.Spec.ClusterIP == "None"
+}
 func (ks *kube2hades) addDNS(subdomain string, service *kapi.Service) error {
 	// if ClusterVIP is not set, a DNS entry should not be created
 	if !ks.IsServiceVIPSet(service) {
 		glog.V(2).Info("ignore the svc for cluster LB VIP is nil : %s", service.Name)
+		return nil
+	}
+	// SRV
+	if  ks.isServiceSrv(service){
 		return nil
 	}
 	return ks.generateRecordsForPortalService(subdomain, service)
@@ -297,6 +335,9 @@ func buildDNSNameString(labels ...string) string {
 func createServiceLW(kubeClient *kclient.Client) *kcache.ListWatch {
 	return kcache.NewListWatchFromClient(kubeClient, "services", kapi.NamespaceAll, kselector.Everything())
 }
+func createEndpointsLW(kubeClient *kclient.Client) *kcache.ListWatch {
+	return kcache.NewListWatchFromClient(kubeClient, "endpoints", kapi.NamespaceAll, kselector.Everything())
+}
 
 func (ks *kube2hades) newService(obj interface{}) {
 	if s, ok := obj.(*kapi.Service); ok {
@@ -304,7 +345,99 @@ func (ks *kube2hades) newService(obj interface{}) {
 		ks.addDNS(name, s)
 	}
 }
+func (ks *kube2hades)checkEndpointUpdate(objNew interface{},objOld interface{}) bool {
+	olde, ok1 := objOld.(*kapi.Endpoints)
+	newe, ok2 := objNew.(*kapi.Endpoints)
+	if ok1 && ok2{
+		if( olde.Name != newe.Name || olde.Namespace != newe.Namespace || len(olde.Subsets) != len(newe.Subsets)) {
+			return true
+		}
+		return false
+	}
+	return false
+}
 
+func (ks *kube2hades) handleEndpointAdd(obj interface{}) {
+	if e, ok := obj.(*kapi.Endpoints); ok {
+		name := buildDNSNameString(ks.domain, serviceSubdomain, e.Namespace, e.Name)
+		ks.addDNSUsingEndpoints(name, e)
+	}
+}
+func (ks *kube2hades) getServiceFromEndpoints(e *kapi.Endpoints) (*kapi.Service, error) {
+	key, err := kcache.MetaNamespaceKeyFunc(e)
+	if err != nil {
+		return nil, err
+	}
+	obj, exists, err := ks.servicesStore.GetByKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get service object from services store - %v", err)
+	}
+	if !exists {
+		glog.V(1).Infof("could not find service for endpoint %q in namespace %q", e.Name, e.Namespace)
+		return nil, nil
+	}
+	if svc, ok := obj.(*kapi.Service); ok {
+		return svc, nil
+	}
+	return nil, fmt.Errorf("got a non service object in services store %v", obj)
+}
+
+func (ks *kube2hades) addDNSUsingEndpoints(subdomain string, e *kapi.Endpoints) error {
+	ks.mlock.Lock()
+	defer ks.mlock.Unlock()
+	svc, err := ks.getServiceFromEndpoints(e)
+	if err != nil {
+		return err
+	}
+	if svc == nil || !ks.isServiceSrv(svc) {
+		// No headless service found corresponding to endpoints object.
+		return nil
+	}
+	// Remove existing DNS entry.
+	if err := ks.removeDNS(subdomain); err != nil {
+		return err
+	}
+	return ks.generateRecordsForHeadlessService(subdomain, e, svc)
+}
+
+func (ks *kube2hades) generateRecordsForHeadlessService(subdomain string, e *kapi.Endpoints, svc *kapi.Service) error {
+	for idx := range e.Subsets {
+		for subIdx := range e.Subsets[idx].Addresses {
+			endpointIP := e.Subsets[idx].Addresses[subIdx].IP
+			b, err := json.Marshal(getHadesMsg(endpointIP, 0,"A"))
+			if err != nil {
+				return err
+			}
+			recordValue := string(b)
+			recordLabel := getHash(recordValue)
+
+			recordKey := buildDNSNameString(subdomain, recordLabel)
+
+			glog.V(2).Infof("Setting DNS record: %v -> %q\n", recordKey, recordValue)
+			if err := ks.writeHadesRecord(recordKey, recordValue); err != nil {
+				return err
+			}
+
+			var ports []string
+
+			for portIdx := range e.Subsets[idx].Ports {
+				endpointPort := &e.Subsets[idx].Ports[portIdx]
+				portSegment := buildPortSegmentString(endpointPort.Name, endpointPort.Protocol)
+				if portSegment != "" {
+					err := ks.generateSRVRecord(subdomain, portSegment, recordLabel, recordKey, endpointPort.Port)
+					if err != nil {
+						return err
+					}
+					ports = append(ports, fmt.Sprintf("%d",endpointPort.Port) )
+				}
+			}
+			// write monitor
+			ks.writeIpMonitorRecord(endpointIP,ports)
+		}
+	}
+
+	return nil
+}
 func (ks *kube2hades) removeService(obj interface{}) {
 	if s, ok := obj.(*kapi.Service); ok {
 		// no vip return
@@ -317,10 +450,13 @@ func (ks *kube2hades) removeService(obj interface{}) {
 		if err != nil {
 			glog.Infof("removeService err: %s", err.Error())
 		}
-		err = ks.deleteIpMonitorRecord(s.Status.LoadBalancer.Ingress[0].IP)
-		if err != nil {
-			glog.Infof("deleteIpMonitorRecord err: %s", err.Error())
+		for _,ip := range(s.Spec.ExternalIPs){
+			err = ks.deleteIpMonitorRecord(ip)
+			if err != nil {
+				glog.Infof("deleteIpMonitorRecord err: %s", err.Error())
+			}
 		}
+
 	}
 }
 
@@ -374,6 +510,26 @@ func watchForServices(kubeClient *kclient.Client, ks *kube2hades) kcache.Store {
 	return serviceStore
 }
 
+func watchEndpoints(kubeClient *kclient.Client, ks *kube2hades) kcache.Store {
+	eStore, eController := kcache.NewInformer(
+		createEndpointsLW(kubeClient),
+		&kapi.Endpoints{},
+		resyncPeriod,
+		kcache.ResourceEventHandlerFuncs{
+			AddFunc: ks.handleEndpointAdd,
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				if ks.checkEndpointUpdate(newObj, oldObj){
+					ks.handleEndpointAdd(newObj)
+				}
+
+			},
+		},
+	)
+
+	go eController.Run(wait.NeverStop)
+	return eStore
+}
+
 func getHash(text string) string {
 	h := fnv.New32a()
 	h.Write([]byte(text))
@@ -424,42 +580,96 @@ func checkConfigOps(){
 		glog.Fatal("both kube-enable and api-enable are nil , check config file : ",configFile)
 	}
 }
+func (ks *kube2hades) getServicesSRVRecords(s *kapi.Service,svcMap map[string]string,ipPorts map[string][]string) {
+	// get endpoint
+	var e *kapi.Endpoints = nil
+	for _, m := range ks.endpointsStore.List() {
+		ep := m.(*kapi.Endpoints)
+		if s.Name == ep.Name && s.Namespace == ep.Namespace {
+			e = ep
+			break
+		}
+	}
+	if e == nil{
+		return
+	}
+	subdomain := buildDNSNameString(ks.domain, serviceSubdomain, e.Namespace, e.Name)
 
+	// get the key val
+	for idx := range e.Subsets {
+		for subIdx := range e.Subsets[idx].Addresses {
+			endpointIP := e.Subsets[idx].Addresses[subIdx].IP
+			b, err := json.Marshal(getHadesMsg(endpointIP, 0,"A"))
+			if err != nil {
+				return
+			}
+			recordValue := string(b)
+			recordLabel := getHash(recordValue)
+			recordKey := buildDNSNameString(subdomain, recordLabel)
+
+			svcMap[hadesmsg.Path(recordKey)] = recordValue
+
+		        //srv
+			for portIdx := range e.Subsets[idx].Ports {
+				endpointPort := &e.Subsets[idx].Ports[portIdx]
+				portSegment := buildPortSegmentString(endpointPort.Name, endpointPort.Protocol)
+				if portSegment != "" {
+					recordKeyReal := buildDNSNameString(subdomain, portSegment, recordLabel)
+					srv_rec, err := json.Marshal(getHadesMsg(recordKey, int(endpointPort.Port),"SRV"))
+					if err != nil {
+						return
+					}
+					svcMap[hadesmsg.Path(recordKeyReal)] = string(srv_rec)
+					ipPorts[endpointIP] = append(ipPorts[endpointIP],fmt.Sprintf("%d",endpointPort.Port) )
+				}
+			}
+		}
+	}
+	return
+}
 func (ks *kube2hades) getServicesFromKube() (map[string]string,map[string][]string, bool) {
 	svcMap := make(map[string]string)
-	fipPotrs := make(map[string][]string)
+	ipPorts := make(map[string][]string)
 	services := ks.servicesStore.List()
 
 	if len(services) ==0{
 		glog.Infof("getServices : list no svcs found\n")
-		return svcMap , fipPotrs,false
+		return svcMap , ipPorts,false
 	}
 	for _, s := range services {
 		if s, ok := s.(*kapi.Service); ok {
+
+			// SDR record
+			if  ks.isServiceSrv(s) {
+				ks.getServicesSRVRecords(s,svcMap,ipPorts)
+				continue
+			}
 
 			if !ks.IsServiceVIPSet(s){
 				glog.V(2).Info("ignore the svc for cluster LB VIP is nil : %s", s.Name)
 				continue
 			}
-			b, err := json.Marshal(getHadesMsg(s.Status.LoadBalancer.Ingress[0].IP , 0))
-			if err != nil {
-				continue
-			}
-			recordValue := string(b)
-			recordLabel := getHash(recordValue)
-			recordKey := buildDNSNameString(ks.domain, serviceSubdomain, s.Namespace, s.Name, recordLabel)
-			svcMap[hadesmsg.Path(recordKey)] = recordValue
+			for _, ip := range(s.Spec.ExternalIPs){
+				b, err := json.Marshal(getHadesMsg(ip , 0,"A"))
+				if err != nil {
+					continue
+				}
+				recordValue := string(b)
+				recordLabel := getHash(recordValue)
+				recordKey := buildDNSNameString(ks.domain, serviceSubdomain, s.Namespace, s.Name, recordLabel)
+				svcMap[hadesmsg.Path(recordKey)] = recordValue
 
-			// get ports
-                        ipKey := s.Status.LoadBalancer.Ingress[0].IP
-			for i := range s.Spec.Ports {
-				port := &s.Spec.Ports[i]
-				fipPotrs[ipKey] = append(fipPotrs[ipKey],fmt.Sprintf("%d", port.Port) )
+				// get ports
+				for i := range s.Spec.Ports {
+					port := &s.Spec.Ports[i]
+					ipPorts[ip] = append(ipPorts[ip],fmt.Sprintf("%d", port.Port) )
+				}
 			}
+
 	       }
 		continue
 	}
-	return svcMap, fipPotrs,true
+	return svcMap, ipPorts,true
 }
 
 func (ks *kube2hades) kubeLoopNodes(n *etcd.Nodes,sx map[string]string, hosts map[string]bool ) error{
@@ -467,7 +677,7 @@ func (ks *kube2hades) kubeLoopNodes(n *etcd.Nodes,sx map[string]string, hosts ma
 
 	for _, n := range *n {
 		if n.Dir {
-			err := ks.kubeLoopNodes(&n.Nodes, sx,hosts)
+			err := ks.kubeLoopNodes(&n.Nodes, sx, hosts)
 			if err != nil {
 				return err
 			}
@@ -480,7 +690,10 @@ func (ks *kube2hades) kubeLoopNodes(n *etcd.Nodes,sx map[string]string, hosts ma
 		switch record.Dnstype{
 		case "A":
 			sx[n.Key] = n.Value
-			hosts[record.Host] = true
+			hosts[record.Host]  = true
+		// no use etcd get cannot find _tcp
+		case "SRV":
+			sx[n.Key] = n.Value
 		default:
 			continue
 		}
@@ -506,14 +719,14 @@ func (ks *kube2hades) syncKube2Hades() {
 	glog.V(2).Info("Begin syncKube2Hades...")
         var kubeServices map[string]string
 	var ok bool
-	kubeServices, floatintIpPotrs,ok = ks.getServicesFromKube()
+	kubeServices, monitorIpPotrs,ok = ks.getServicesFromKube()
 	if ok != true{
 		return
 	}
 	svcHades := make(map[string]string)
-	svcHosts := make(map[string]bool)
+	hostHades := make(map[string]bool)
 	// just get svc.
-	err := ks.getServicesFromHades(serviceSubdomain + "."+ gConfig.General.HadesDomain ,svcHades,svcHosts)
+	err := ks.getServicesFromHades(serviceSubdomain + "."+ gConfig.General.HadesDomain ,svcHades,hostHades)
 	if err != nil{
 		retStr := err.Error()
 		// if key not fond, keep going
@@ -549,11 +762,10 @@ func (ks *kube2hades) syncKube2Hades() {
 
 func (ks *kube2hades) syncHadesHostStatus() {
 	glog.V(2).Info("Begin syncHadesHostStatus...")
-
+	// just get svc + user define
 	svcHades := make(map[string]string)
-	svcHosts := make(map[string]bool)
-	//  get svc + user
-	err := ks.getServicesFromHades(gConfig.General.HadesDomain ,svcHades,svcHosts)
+	hostsHades := make(map[string]bool)
+	err := ks.getServicesFromHades(gConfig.General.HadesDomain ,svcHades,hostsHades)
 	if err != nil{
 		retStr := err.Error()
 		// if key not fond, keep going
@@ -585,17 +797,18 @@ func (ks *kube2hades) syncHadesHostStatus() {
 	}
 
 	//update the diffs
-	for key,_ := range svcHosts {
+	for key,_ := range hostsHades {
 		glog.V(4).Infof("svcHosts key: %s\n",key)
+
 		_, exists := monitorIps[key]
 		if !exists{
 			var status apiHadesIpMonitor
 			status.Status = "UP"
 
 			// check ports
-			_, exists = floatintIpPotrs[key]
+			_, exists = monitorIpPotrs[key]
 			if exists{
-				status.Ports = floatintIpPotrs[key][:]
+				status.Ports = monitorIpPotrs[key][:]
 			}
 
 			b, err := json.Marshal(status)
@@ -610,7 +823,7 @@ func (ks *kube2hades) syncHadesHostStatus() {
 
 	for key,_ := range monitorIps {
 		glog.V(4).Infof("monitorIps key: %s\n",key)
-		_, exists := svcHosts[key]
+		_, exists := hostsHades[key]
 		if !exists{
 			ks.etcdClient.DeleteRaw(gConfig.General.IpMonitorPath + key)
 		}
@@ -663,6 +876,7 @@ func main() {
 			glog.Fatalf("Failed to create a kubernetes client: %v", err)
 		}
 		ks.servicesStore = watchForServices(kubeClient, &ks)
+		ks.endpointsStore = watchEndpoints(kubeClient, &ks)
 
 		go ks.svcSyncLoop(syncAllPeriod)
         }

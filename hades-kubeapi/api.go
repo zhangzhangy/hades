@@ -12,6 +12,7 @@ import (
 	etcd "github.com/coreos/etcd/client"
 	"github.com/golang/glog"
 	"github.com/ipdcode/hades/utils"
+	"github.com/gorilla/mux"
 )
 
 const (
@@ -20,10 +21,15 @@ const (
 	svcSubdomain = "svc"
 
 	noDomainName = "ERR, no domain name"
+	errDomainContainDot = "ERR,  domain name cant not contain dot"
 	noFindDomainName = "ERR, no find  domain name"
 	errDeleteDomainName = "ERR, delete domain name error"
+	errDeleteK8sSvc = "ERR, can not del k8s svc"
 	errSetDomainName    = "ERR, set domain name error"
-	errSetDomainNameDupIp    = "ERR, set domain name error  exists:"
+	errSetDomainNameExists    = "ERR, set domain name error  domain exists "
+	errSetAliasNameExists    = "ERR, set domain name error  alias exists "
+	noFindAliasName    = "ERR, not find   alias name "
+	noMatchAliasName    = "ERR, alias name and domain not match "
         errUpdateDomainName    = "ERR, update domain name error"
 	errGetDomainName    = "ERR, get domain name error"
 	noAuthorization = "ERR, no Authorization"
@@ -43,12 +49,22 @@ type apiService struct {
 	DomainIps []string `json:"ips,omitempty"`
 	DomainAlias  string `json:"alias,omitempty"`
 	UpdateMap   map[string]string  `json:"update,omitempty"`
+	NsHost string `json:"nsHost,omitempty"`
+	MailHost string `json:"mailHost,omitempty"`
+	MailPriority int `json:"mailPriority,omitempty"`
+	TxtRecord    string `json:"text,omitempty"`
 }
 
 // a record to etcd
 type apiHadesRecord struct {
 	Host    string `json:"host,omitempty"`
 	Dnstype string  `json:"type,omitempty"`
+	Mail    bool `json:"mail,omitempty"`
+	MailPriority int  `json:"priority,omitempty"`
+
+	Text string  `json:"text,omitempty"`
+
+
 }
 // a record to etcd for ip monitor
 type apiHadesIpMonitor struct {
@@ -83,7 +99,7 @@ func (a *hadesApi)buildDNSNameString(labels ...string) string {
 	return res
 }
 
-func (a *hadesApi) setHadesRecord(name string, ipaddr string,dnsType string) string {
+func (a *hadesApi) setHadesRecordHost(name string, ipaddr string,dnsType string) string {
         var svc apiHadesRecord
 	svc.Host = ipaddr
 	svc.Dnstype = dnsType
@@ -93,7 +109,7 @@ func (a *hadesApi) setHadesRecord(name string, ipaddr string,dnsType string) str
 		return errSetDomainName
 	}
 	recordValue := string(b)
-	glog.V(2).Infof("setHadesRecord:%s",hadesmsg.Path(name))
+	glog.V(2).Infof("setHadesRecordHost:%s",hadesmsg.Path(name))
 
 	err = a.etcdClient.Set(hadesmsg.Path(name), recordValue)
 
@@ -101,7 +117,7 @@ func (a *hadesApi) setHadesRecord(name string, ipaddr string,dnsType string) str
 		retStr := err.Error()
 		if strings.HasPrefix(retStr,etcdKeyalReadyExists){
 			glog.Infof("Err: %s\n",retStr)
-			return errSetDomainNameDupIp + ipaddr
+			return errSetDomainNameExists + ipaddr
 		}
 		glog.Infof("Err: %s\n",retStr)
 		return errSetDomainName
@@ -109,6 +125,64 @@ func (a *hadesApi) setHadesRecord(name string, ipaddr string,dnsType string) str
 		return  apiSucess
 	}
 }
+
+func (a *hadesApi) setHadesRecordMail(name string, host string,priority int ,dnsType string) string {
+        var svc apiHadesRecord
+	svc.Host = host
+	svc.Dnstype = dnsType
+	svc.Mail    = true
+	svc.MailPriority = priority
+	b, err := json.Marshal(svc)
+	if err != nil {
+		glog.Errorf("%s\n", err.Error())
+		return errSetDomainName
+	}
+	recordValue := string(b)
+	glog.V(2).Infof("setHadesRecordHost:%s",hadesmsg.Path(name))
+
+	err = a.etcdClient.Set(hadesmsg.Path(name), recordValue)
+
+	if err != nil {
+		retStr := err.Error()
+		if strings.HasPrefix(retStr,etcdKeyalReadyExists){
+			glog.Infof("Err: %s\n",retStr)
+			return errSetDomainNameExists
+		}
+		glog.Infof("Err: %s\n",retStr)
+		return errSetDomainName
+	}else{
+		return  apiSucess
+	}
+}
+
+func (a *hadesApi) setHadesRecordText(name string, text string,dnsType string) string {
+        var svc apiHadesRecord
+	svc.Text = text
+	svc.Dnstype = dnsType
+
+	b, err := json.Marshal(svc)
+	if err != nil {
+		glog.Errorf("%s\n", err.Error())
+		return errSetDomainName
+	}
+	recordValue := string(b)
+	glog.V(2).Infof("setHadesRecordHost:%s",hadesmsg.Path(name))
+
+	err = a.etcdClient.Set(hadesmsg.Path(name), recordValue)
+
+	if err != nil {
+		retStr := err.Error()
+		if strings.HasPrefix(retStr,etcdKeyalReadyExists){
+			glog.Infof("Err: %s\n",retStr)
+			return errSetDomainNameExists
+		}
+		glog.Infof("Err: %s\n",retStr)
+		return errSetDomainName
+	}else{
+		return  apiSucess
+	}
+}
+
 func (a *hadesApi) updateHadesRecord(name string, preVal string,newVal string, dnsType string) string {
         var svc apiHadesRecord
 	svc.Host = preVal
@@ -228,10 +302,31 @@ func (a *hadesApi) apiLoopNodes(n *etcd.Nodes,sx map[string]apiService) (err err
 			serv.OpsType   = "A"
 			sx[key] = *serv
 		case "CNAME":
-			key := a.getDomainNameFromKeyCname(n.Key)
+			key := a.getDomainNameFromKey(n.Key)
 			serv := new(apiService)
 			serv.OpsType   = "CNAME"
 			serv.AliasDomain = record.Host
+			sx[key] = *serv
+		case "NS":
+			key := a.getDomainNameFromKey(n.Key)
+			serv := new(apiService)
+			serv.OpsType   = "NS"
+			serv.NsHost = record.Host
+			sx[key] = *serv
+
+		case "MX":
+			key := a.getDomainNameFromKey(n.Key)
+			serv := new(apiService)
+			serv.OpsType   = "MX"
+			serv.MailHost = record.Host
+			serv.MailPriority = record.MailPriority
+			sx[key] = *serv
+
+		case "TXT":
+			key := a.getDomainNameFromKey(n.Key)
+			serv := new(apiService)
+			serv.OpsType   = "TXT"
+			serv.TxtRecord = record.Text
 			sx[key] = *serv
 
 		default:
@@ -242,7 +337,7 @@ func (a *hadesApi) apiLoopNodes(n *etcd.Nodes,sx map[string]apiService) (err err
 	return  nil
 }
 
-func (a *hadesApi)getDomainNameFromKeyCname(key string) string{
+func (a *hadesApi)getDomainNameFromKey(key string) string{
 	keys := strings.Split(key,"/")
 	domLen := len(keys)-1
 	for i, j := 0,domLen; i < j; i, j = i+1, j-1 {
@@ -275,16 +370,20 @@ func (a *hadesApi)doGetHadesRecords(n string,sx map[string]apiService) error {
 	}
 }
 
-func (a *hadesApi) getHadesRecords(name string,sx map[string]apiService) error {
+func (a *hadesApi) getHadesRecords(name string,opstype string, sx map[string]apiService) error {
 
 	n :=""
 	if name !=""{
-		n = a.buildDNSNameString(a.domain,userSubdomain,name)
-		a.doGetHadesRecords(n, sx)
-		n = a.buildDNSNameString(a.domain,svcSubdomain,name)
+		n = a.buildDNSNameString(a.domain,name)
 		return a.doGetHadesRecords(n, sx)
+
 	}else{  // show all
-		n = a.buildDNSNameString(a.domain)
+		switch strings.ToUpper(opstype){
+		case "NS": n = a.buildDNSNameString(a.domain,"ns.dns")
+		case "MX": n = a.buildDNSNameString(a.domain,"mail")
+		case "TXT": n = a.buildDNSNameString(a.domain,"txt")
+		default :  n = a.buildDNSNameString(a.domain)
+		}
 		return a.doGetHadesRecords(n, sx)
 	}
 }
@@ -299,8 +398,8 @@ func (a *hadesApi)processTypeAPost(s *apiService,domain string )string{
 		case ip == nil:
 			return notIpAddr
 		case ip.To4() != nil:
-			name := a.buildDNSNameString(a.domain,userSubdomain,domain,a.getHashIp(ipaddr))
-			ret := a.setHadesRecord(name,ipaddr,"A")
+			name := a.buildDNSNameString(a.domain,domain,a.getHashIp(ipaddr))
+			ret := a.setHadesRecordHost(name,ipaddr,"A")
 			if ret != apiSucess{
 				return ret
 			}
@@ -315,10 +414,11 @@ func (a *hadesApi)processTypeAPost(s *apiService,domain string )string{
 func (a *hadesApi)processTypeADelete(s *apiService,domain string )string{
 
 	name :=""
+	ret :=""
 	// no ips del all
 	if len(s.DomainIps) == 0{
-		name = a.buildDNSNameString(a.domain,userSubdomain,domain)
-		ret := a.deleteHadesRecord(name)
+		name = a.buildDNSNameString(a.domain,domain)
+		ret = a.deleteHadesRecord(name)
 		return ret
 	}
 	for _, ipaddr := range s.DomainIps{
@@ -327,8 +427,8 @@ func (a *hadesApi)processTypeADelete(s *apiService,domain string )string{
 		case ip == nil:
 			return notIpAddr
 		case ip.To4() != nil:
-			name = a.buildDNSNameString(a.domain,userSubdomain,domain,a.getHashIp(ipaddr))
-			ret := a.deleteHadesRecord(name)
+			name = a.buildDNSNameString(a.domain,domain,a.getHashIp(ipaddr))
+			ret = a.deleteHadesRecord(name)
 			if ret != apiSucess{
 				return ret
 			}
@@ -336,6 +436,14 @@ func (a *hadesApi)processTypeADelete(s *apiService,domain string )string{
 
 		default:
 			return notSupportIpv6
+		}
+	}
+	if ret == apiSucess{
+		svc := make(map[string]apiService)
+		err := a.getHadesRecords(domain,"A", svc)
+		if len(svc) == 0 && err == nil{
+			name = a.buildDNSNameString(a.domain,domain)
+			a.deleteHadesRecord(name)
 		}
 	}
 	return apiSucess
@@ -347,15 +455,24 @@ func (a *hadesApi )processTypeAPut(s *apiService, domain string)string {
 		ipNew := net.ParseIP(val)
 
 		if ipPre.To4() != nil && ipNew.To4() != nil {
-			name := a.buildDNSNameString(a.domain, userSubdomain, domain, a.getHashIp(key))
+			// check val exist
+			name := a.buildDNSNameString(a.domain, domain, a.getHashIp(val))
+			_, err := a.etcdClient.Get(hadesmsg.Path(name), true,true)
+			if err == nil {
+				return errSetDomainNameExists + val
+			}
+
+			//del old
+			name = a.buildDNSNameString(a.domain, domain, a.getHashIp(key))
 			ret := a.deleteHadesRecord(name)
 			if ret != apiSucess {
 				return ret
 			}
 			a.deleteIpMonitorRecord(key)
-
-			name = a.buildDNSNameString(a.domain, userSubdomain, domain, a.getHashIp(val))
-			ret = a.setHadesRecord(name, val,"A")
+                        // add new
+			name = a.buildDNSNameString(a.domain, domain, a.getHashIp(val))
+			ret = a.setHadesRecordHost(name, val,"A")
+			//
 			if ret != apiSucess {
 				return ret
 			}
@@ -372,141 +489,265 @@ func (a *hadesApi )processTypeAPut(s *apiService, domain string)string {
 
 func (a *hadesApi )processTypeCnamePut(s *apiService, domain string)string {
 	for key, val := range s.UpdateMap {
-		name := a.buildDNSNameString(a.domain,userSubdomain,key)
+		// check key exist
+		name := a.buildDNSNameString(a.domain, key)
+		svc := make(map[string]apiService)
+		a.doGetHadesRecords(name, svc)
+		if len(svc)==0 {
+			return noFindAliasName + key
+		}
+		for _, v := range svc {
+			if v.OpsType == "CNAME" && v.AliasDomain != domain{
+				return noMatchAliasName +  key
+			}
+   		 }
+
+		// check val exist
+		name = a.buildDNSNameString(a.domain, val)
+		_, err := a.etcdClient.Get(hadesmsg.Path(name), true,true)
+		if err == nil {
+			return errSetAliasNameExists + val
+		}
+
+		name = a.buildDNSNameString(a.domain,key)
 		ret := a.deleteHadesRecord(name)
 		if ret == apiSucess{
-			nameNew := a.buildDNSNameString(a.domain,userSubdomain,val)
-			return a.setHadesRecord(nameNew, domain,"CNAME")
+			nameNew := a.buildDNSNameString(a.domain,val)
+			return a.setHadesRecordHost(nameNew, domain,"CNAME")
+
 		}
 		return ret
 	}
 	return apiSucess
 }
-func (a *hadesApi)processPost(s *apiService, domain string )string{
+
+func (a *hadesApi)checkPostExist( name string )bool {
+	if a.checkK8sSvcDir(name){
+		return true
+	}
+	// check k8s namespaces
+	k8sNs := a.buildDNSNameString(a.domain,svcSubdomain,name)
+	_, err  := a.etcdClient.Get(hadesmsg.Path(k8sNs),false,true)
+	if err == nil{
+		return true
+	}
+	// check user domain set
+	userDir := a.buildDNSNameString(a.domain,name)
+	_, err  = a.etcdClient.Get(hadesmsg.Path(userDir),false,true)
+	if err == nil{
+		return true
+	}
+	return false
+}
+
+func (a *hadesApi) statsAuthorization(w http.ResponseWriter, r *http.Request)bool{
+	val,ok := r.Header["Token"]
+	if !ok{
+		fmt.Fprintf(w, "%s\n",noAuthorization)
+		return false
+	}
+	if strings.Compare(val[0], hapi.auth) != 0 {
+		fmt.Fprintf(w, "%s\n",errAuthorization)
+		return false
+	}
+	return true
+}
+func (a *hadesApi)checkK8sSvcDir(domain string)bool{
+	return  domain ==svcSubdomain
+}
+func (a *hadesApi)getReqBody(r *http.Request,s *apiService){
+	result, _:= ioutil.ReadAll(r.Body)
+	r.Body.Close()
+
+	glog.V(4).Infof("api req body :%s\n" ,result)
+	json.Unmarshal([]byte(result), s)
+}
+
+func (a *hadesApi)processDelete(w http.ResponseWriter, r *http.Request){
+
+	if ! a.statsAuthorization(w,r){
+		return
+	}
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	var s apiService;
+	a.getReqBody(r,&s)
 
 	if domain == ""{
-		return noDomainName
+		fmt.Fprintf(w, "%s\n",noDomainName)
+		return
+	}
+	if  a.checkK8sSvcDir(domain){
+		fmt.Fprintf(w, "%s\n",errDeleteK8sSvc)
+		return
+	}
+	ret := ""
+	if s.OpsType == ""{
+		name := a.buildDNSNameString(a.domain,domain)
+		ret = a.deleteHadesRecord(name)
+		fmt.Fprintf(w, "%s\n",ret)
+		return
+	}
+	switch strings.ToUpper(s.OpsType){
+	case "A":
+		ret = a.processTypeADelete(&s,domain)
+	case "CNAME":
+		name := a.buildDNSNameString(a.domain,domain)
+		ret = a.deleteHadesRecord(name)
+	case "NS":
+		name := a.buildDNSNameString(a.domain,"ns.dns",domain)
+		ret = a.deleteHadesRecord(name)
+	case "MX":
+		name := a.buildDNSNameString(a.domain,"mail",domain)
+		ret = a.deleteHadesRecord(name)
+	case "TXT":
+		name := a.buildDNSNameString(a.domain,"txt",domain)
+		ret = a.deleteHadesRecord(name)
+	default:
+		ret = noOpsType
+	}
+	fmt.Fprintf(w, "%s\n",ret)
+}
+func (a *hadesApi)processPost(w http.ResponseWriter, r *http.Request){
+	if ! a.statsAuthorization(w,r){
+		return
+	}
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	var s apiService;
+	a.getReqBody(r,&s)
+
+	if domain == ""{
+		fmt.Fprintf(w, "%s\n",noDomainName)
+		return
 	}
 	if "" == s.OpsType{
-		return notSupportOpsType
+		fmt.Fprintf(w, "%s\n",notSupportOpsType)
+		return
 	}
+
 	ret :=""
 	switch strings.ToUpper(s.OpsType){
 	case "A":
-		ret = a.processTypeAPost(s,domain)
+		// check exitst
+		dot := strings.Split(domain,".")
+		if len(dot)>1{
+			fmt.Fprintf(w, "%s\n",errDomainContainDot)
+			return
+		}
+		if a.checkPostExist(domain){
+			fmt.Fprintf(w, "%s\n",errSetDomainNameExists)
+			return
+		}
+		ret = a.processTypeAPost(&s,domain)
 	case "CNAME":
-		name := a.buildDNSNameString(a.domain,userSubdomain,s.DomainAlias)
-		ret = a.setHadesRecord(name,domain,"CNAME")
+		if a.checkPostExist(s.DomainAlias){
+			fmt.Fprintf(w, "%s\n",errSetAliasNameExists)
+			return
+		}
+		name := a.buildDNSNameString(a.domain,s.DomainAlias)
+		ret = a.setHadesRecordHost(name,domain,"CNAME")
+	case "NS":
+		name := a.buildDNSNameString(a.domain,"ns.dns",domain)
+		ret = a.setHadesRecordHost(name,s.NsHost,"NS")
+	case "MX":
+		name := a.buildDNSNameString(a.domain,"mail",domain)
+		ret = a.setHadesRecordMail(name,s.MailHost,s.MailPriority,"MX")
+
+	case "TXT":
+		name := a.buildDNSNameString(a.domain,"txt",domain)
+		ret = a.setHadesRecordText(name,s.TxtRecord,"TXT")
 	default:
-		return noOpsType
+		ret= noOpsType
 	}
-	return ret
+	fmt.Fprintf(w, "%s\n",ret)
+	return
 }
 
-func (a *hadesApi)processPut(s *apiService, domain string)string{
+func (a *hadesApi)processPut(w http.ResponseWriter, r *http.Request){
+	if ! a.statsAuthorization(w,r){
+		return
+	}
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	var s apiService;
+	a.getReqBody(r,&s)
 
 	if domain == ""{
-		return noDomainName
+		fmt.Fprintf(w, "%s\n",noDomainName)
+		return
 	}
 	if "" == s.OpsType{
-		return notSupportOpsType
+		fmt.Fprintf(w, "%s\n",notSupportOpsType)
+		return
 	}
 	if len(s.UpdateMap) ==0{
-		return errBodyUpdate
+		fmt.Fprintf(w, "%s\n",errBodyUpdate)
+		return
 	}
 	ret :=""
 	switch strings.ToUpper(s.OpsType){
 	case "A":
-		ret = a.processTypeAPut(s,domain)
+		ret = a.processTypeAPut(&s,domain)
 	case "CNAME":
-		ret = a.processTypeCnamePut(s, domain)
+		ret = a.processTypeCnamePut(&s, domain)
 	default:
-		return noOpsType
+		ret = noOpsType
 	}
-	return ret
+	fmt.Fprintf(w, "%s\n",ret)
+	return
 
 }
-func (a *hadesApi)processGet(s *apiService,domain string)string{
+func (a *hadesApi)processGet(w http.ResponseWriter, r *http.Request){
+	if ! a.statsAuthorization(w,r){
+		return
+	}
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	svc := make(map[string]apiService)
+	err := a.getHadesRecords(domain,"A", svc)
 
-        svc := make(map[string]apiService)
-	err := a.getHadesRecords(domain, svc)
-	if err != nil{
+	if len(svc) == 0 && err != nil{
 		glog.Errorf("%s\n", err.Error())
-		return errGetDomainName
+		fmt.Fprintf(w, "%s\n",noFindDomainName)
+		return
 	}
 
 	b, err := json.Marshal(svc)
 	if err != nil {
 		glog.Errorf("%s\n", err.Error())
-		return errGetDomainName
-	}
-	return string(b)
-
-}
-func (a *hadesApi)processDelete(s *apiService,domain string)string{
-
-	if domain == ""{
-		return noDomainName
-	}
-	ret := ""
-	if s.OpsType == ""{
-		name := a.buildDNSNameString(a.domain,userSubdomain,domain)
-		ret = a.deleteHadesRecord(name)
-		return ret
-	}
-	switch strings.ToUpper(s.OpsType){
-	case "A":
-		ret = a.processTypeADelete(s,domain)
-	case "CNAME":
-		name := a.buildDNSNameString(a.domain,userSubdomain,domain)
-		ret = a.deleteHadesRecord(name)
-	default:
-		return noOpsType
-	}
-	return ret
-}
-
-func (a *hadesApi) handler(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-
-	val,ok := r.Header["Token"]
-	if !ok{
-		fmt.Fprintf(w, "%s",noAuthorization)
+		fmt.Fprintf(w, "%s\n",errGetDomainName)
 		return
 	}
-	if strings.Compare(val[0], hapi.auth) != 0 {
-		fmt.Fprintf(w, "%s",errAuthorization)
+	fmt.Fprintf(w, "%s\n",string(b))
+	return
+}
+func (a *hadesApi)processGetAll(w http.ResponseWriter, r *http.Request){
+	if ! a.statsAuthorization(w,r){
 		return
 	}
-	result, _:= ioutil.ReadAll(r.Body)
-	r.Body.Close()
-
-	glog.V(4).Infof("api req body :%s\n" ,result)
-
 	var s apiService;
-	json.Unmarshal([]byte(result), &s)
+	a.getReqBody(r,&s)
+        glog.Infof("s =%s\n",s)
 
-	domainName := ""
-	domain,ok := r.Header["Domain"]
-	if ok{
-		domainName = strings.ToLower(domain[0])
+        svc := make(map[string]apiService)
+	err := a.getHadesRecords("",s.OpsType, svc)
+
+	if len(svc) == 0 && err != nil{
+		glog.Errorf("%s\n", err.Error())
+		fmt.Fprintf(w, "%s\n",errGetDomainName)
+		return
 	}
 
-	ret :=""
-	switch strings.ToUpper(r.Method){
-	case "PUT":
-		ret = a.processPut(&s,domainName)
-	case "POST":
-		ret = a.processPost(&s,domainName)
-	case "GET":
-		ret = a.processGet(&s,domainName)
-	case "DELETE":
-		ret = a.processDelete(&s,domainName)
-	default:
-		ret = notSupportOpsType
+	b, err := json.Marshal(svc)
+	if err != nil {
+		glog.Errorf("%s\n", err.Error())
+		fmt.Fprintf(w, "%s\n",errGetDomainName)
+		return
 	}
+	fmt.Fprintf(w, "%s\n",string(b))
+	return
 
-	fmt.Fprintf(w, "%s\n",ret)
 }
 
 func RunApi(client *tools.EtcdOps, apiAddr string, domain string, auth string, ipMonitorPath string) {
@@ -521,7 +762,14 @@ func RunApi(client *tools.EtcdOps, apiAddr string, domain string, auth string, i
 	hapi.domain = domain
 	hapi.auth   = auth
 	hapi.ipMonitorPath = ipMonitorPath
-	http.HandleFunc("/hades",hapi.handler)
 
-	go http.ListenAndServe(apiAddr, nil)
+	r := mux.NewRouter()
+	r.HandleFunc("/hades/api", hapi.processGetAll).Methods("GET")
+	r.HandleFunc("/hades/api/", hapi.processGetAll).Methods("GET")
+	r.HandleFunc("/hades/api/{domain}", hapi.processGet).Methods("GET")
+	r.HandleFunc("/hades/api/{domain}", hapi.processDelete).Methods("DELETE")
+	r.HandleFunc("/hades/api/{domain}", hapi.processPost).Methods("POST")
+	r.HandleFunc("/hades/api/{domain}", hapi.processPut).Methods("PUT")
+
+	go http.ListenAndServe(apiAddr, r)
 }
