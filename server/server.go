@@ -344,21 +344,14 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 	if q.Qtype == dns.TypePTR && strings.HasSuffix(name, ".in-addr.arpa.") || strings.HasSuffix(name, ".ip6.arpa.") {
-		resp := s.ServeDNSReverse(w, req)
-		if resp != nil {
-			s.rcache.InsertMessage(cache.Key(q, tcp), resp,remoteIp[0],timeNow)
-	
-		}
+		resp := s.ServeDNSReverse(w, req,remoteIp[0],timeNow)
+		glog.V(4).Infof("ServeDNSReverse %q: %v \n ", q.Name, resp.Answer)
 		return
 	}
 
 	if q.Qclass != dns.ClassCHAOS && !strings.HasSuffix(name, s.config.Domain) {
-		resp := s.ServeDNSForward(w, req)
+		resp := s.ServeDNSForward(w, req,remoteIp[0],timeNow)
 		glog.V(4).Infof("ServeDNSForward %q: %v \n ", q.Name, resp.Answer)
-		if resp != nil {
-			s.rcache.InsertMessage(cache.Key(q, tcp), resp,remoteIp[0],timeNow)
-	
-		}
 		return
 	}
         statsCacheMissResponse++
@@ -436,7 +429,6 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			case "hostname.bind.":
 				fallthrough
 			case "id.server.":
-				// TODO(miek): machine name to return
 				hdr := dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassCHAOS, Ttl: 0}
 				m.Answer = []dns.RR{&dns.TXT{Hdr: hdr, Txt: []string{"localhost"}}}
 				return
@@ -525,7 +517,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 		// if we are here again, check the types, because an answer may only
 		// be given for SRV. All other types should return NODATA, the
-		// NXDOMAIN part is handled in the above code. TODO(miek): yes this
+		// NXDOMAIN part is handled in the above code.
 		// can be done in a more elegant manor.
 		if q.Qtype == dns.TypeSRV {
 			m.Answer = append(m.Answer, records...)

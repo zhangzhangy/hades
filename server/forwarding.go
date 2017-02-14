@@ -6,14 +6,16 @@ package server
 
 import (
 	"fmt"
+	"time"
 	"github.com/golang/glog"
 	"github.com/miekg/dns"
+	"github.com/ipdcode/hades/cache"
 )
 
 // ServeDNSForward forwards a request to a nameservers and returns the response.
-func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
+func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg,remoteIp string, timeNow time.Time) *dns.Msg {
 	statsForwardCount++
-
+	tcp := isTCP(w)
 	if len(s.config.Nameservers) == 0 || dns.CountLabel(req.Question[0].Name) < s.config.Ndots {
 
 		if len(s.config.Nameservers) == 0 {
@@ -26,12 +28,11 @@ func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
 		m.SetReply(req)
 		m.SetRcode(req, dns.RcodeServerFailure)
 		m.Authoritative = false     // no matter what set to false
+		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp),m,remoteIp,timeNow)
 		m.RecursionAvailable = true // and this is still true
 		w.WriteMsg(m)
 		return m
 	}
-
-	tcp := isTCP(w)
 
 	var (
 		r   *dns.Msg
@@ -50,6 +51,7 @@ Redo:
 	if err == nil {
 		r.Compress = true
 		r.Id = req.Id
+		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp), r,remoteIp,timeNow)
 		w.WriteMsg(r)
 		return r
 	}
@@ -65,12 +67,13 @@ Redo:
 	m := new(dns.Msg)
 	m.SetReply(req)
 	m.SetRcode(req, dns.RcodeServerFailure)
+	s.rcache.InsertMessage(cache.Key(req.Question[0], tcp),m,remoteIp,timeNow)
 	w.WriteMsg(m)
 	return m
 }
 // ServeDNSReverse is the handler for DNS requests for the reverse zone. If nothing is found
 // locally the request is forwarded to the forwarder for resolution.
-func (s *server) ServeDNSReverse(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
+func (s *server) ServeDNSReverse(w dns.ResponseWriter, req *dns.Msg,remoteIp string,timeNow time.Time) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(req)
 	m.Compress = true
@@ -78,15 +81,16 @@ func (s *server) ServeDNSReverse(w dns.ResponseWriter, req *dns.Msg) *dns.Msg {
 	m.RecursionAvailable = true
 	var err error
 	if m.Answer, err = s.PTRRecords(req.Question[0]); err == nil {
-		// TODO(miek): Reverse DNSSEC. We should sign this, but requires a key....and more
 		// Probably not worth the hassle?
+		tcp := isTCP(w)
+		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp), m,remoteIp,timeNow)
 		if err := w.WriteMsg(m); err != nil {
 			glog.Infof("failure to return reply %q", err)
 		}
 		return m
 	}
 	// Always forward if not found locally.
-	return s.ServeDNSForward(w, req)
+	return s.ServeDNSForward(w, req,remoteIp,timeNow)
 }
 
 // Lookup looks up name,type using the recursive nameserver defines
