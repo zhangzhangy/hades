@@ -20,26 +20,27 @@ const (
 	userSubdomain = "user"
 	svcSubdomain = "svc"
 
-	noDomainName = "ERR, no domain name"
-	errDomainContainDot = "ERR,  domain name cant not contain dot"
-	noFindDomainName = "ERR, no find  domain name"
+	noDomainName = "ERR, no domain name "
+	errDomainContainDot = "ERR,  domain name cant not contain dot "
+	noFindDomainName = "ERR, no find  domain name "
+	noFindDomainIp = "ERR, no find  domain ip "
 	errDeleteDomainName = "ERR, delete domain name error"
-	errDeleteK8sSvc = "ERR, can not del k8s svc"
-	errSetDomainName    = "ERR, set domain name error"
+	errDeleteK8sSvc = "ERR, can not del k8s svc "
+	errSetDomainName    = "ERR, set domain name error "
 	errSetDomainNameExists    = "ERR, set domain name error  domain exists "
 	errSetAliasNameExists    = "ERR, set domain name error  alias exists "
 	noFindAliasName    = "ERR, not find   alias name "
 	noMatchAliasName    = "ERR, alias name and domain not match "
-        errUpdateDomainName    = "ERR, update domain name error"
-	errGetDomainName    = "ERR, get domain name error"
-	noAuthorization = "ERR, no Authorization"
-	errAuthorization = "ERR, Authorization error"
-	noDomainIps = "ERR, no domain ips"
-	notIpAddr = "ERR, it is not  IP addr"
-	notSupportIpv6 = "ERR, ipv6 tbd"
-	notSupportOpsType = "ERR,type not support"
+        errUpdateDomainName    = "ERR, update domain name error "
+	errGetDomainName    = "ERR, get domain name error "
+	noAuthorization = "ERR, no Authorization "
+	errAuthorization = "ERR, Authorization error "
+	noDomainIps = "ERR, no domain ips "
+	notIpAddr = "ERR, it is not  IP addr "
+	notSupportIpv6 = "ERR, ipv6 tbd "
+	notSupportOpsType = "ERR,type not support "
 	noOpsType = "ERR, no type offered "
-	errBodyUpdate = "ERR, no body update"
+	errBodyUpdate = "ERR, no body update "
 	apiSucess  = "OK"
 )
 
@@ -461,6 +462,17 @@ func (a *hadesApi )processTypeAPut(s *apiService, domain string)string {
 			if err == nil {
 				return errSetDomainNameExists + val
 			}
+			// check key exist
+			name = a.buildDNSNameString(a.domain, domain)
+			_, err = a.etcdClient.Get(hadesmsg.Path(name), true,true)
+			if err != nil {
+				return noFindDomainName + domain
+			}
+			name = a.buildDNSNameString(a.domain, domain, a.getHashIp(key))
+			_, err = a.etcdClient.Get(hadesmsg.Path(name), true,true)
+			if err != nil {
+				return noFindDomainIp + key
+			}
 
 			//del old
 			name = a.buildDNSNameString(a.domain, domain, a.getHashIp(key))
@@ -519,6 +531,13 @@ func (a *hadesApi )processTypeCnamePut(s *apiService, domain string)string {
 		return ret
 	}
 	return apiSucess
+}
+func (a *hadesApi)checkKeyEtcdExist( name string )bool{
+	_, err  := a.etcdClient.Get(hadesmsg.Path(name),false,true)
+	if err == nil{
+		return true
+	}
+	return false
 }
 
 func (a *hadesApi)checkPostExist( name string )bool {
@@ -649,13 +668,25 @@ func (a *hadesApi)processPost(w http.ResponseWriter, r *http.Request){
 		ret = a.setHadesRecordHost(name,domain,"CNAME")
 	case "NS":
 		name := a.buildDNSNameString(a.domain,"ns.dns",domain)
+		if a.checkKeyEtcdExist(name){
+			fmt.Fprintf(w, "%s\n",errSetDomainNameExists + domain)
+			return
+		}
 		ret = a.setHadesRecordHost(name,s.NsHost,"NS")
 	case "MX":
 		name := a.buildDNSNameString(a.domain,"mail",domain)
+		if a.checkKeyEtcdExist(name) {
+			fmt.Fprintf(w, "%s\n", errSetDomainNameExists + domain)
+			return
+		}
 		ret = a.setHadesRecordMail(name,s.MailHost,s.MailPriority,"MX")
 
 	case "TXT":
 		name := a.buildDNSNameString(a.domain,"txt",domain)
+		if a.checkKeyEtcdExist(name) {
+			fmt.Fprintf(w, "%s\n", errSetDomainNameExists + domain)
+			return
+		}
 		ret = a.setHadesRecordText(name,s.TxtRecord,"TXT")
 	default:
 		ret= noOpsType
