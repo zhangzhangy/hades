@@ -91,7 +91,7 @@ func (g *Backend) ReverseRecord(name string) (*msg.Service, error) {
 // outstanding queries.
 func (g *Backend) get(path string, recursive bool) (*etcd.Response, error) {
 	resp, err, _ := g.singleInflight.Do(path, func() (*etcd.Response, error) {
-		r, e := g.client.Get(path, false, recursive)
+		r, e := g.client.Get(path, true, recursive)
 		if e != nil {
 			return nil, e
 		}

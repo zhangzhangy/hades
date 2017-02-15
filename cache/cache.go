@@ -22,6 +22,9 @@ type elem struct {
 	expiration time.Time // time added + TTL, after this the elem is invalid
 	msg        *dns.Msg
 	mAnswer    map[string][]dns.RR // keep to return the pre RR for
+	requestCount int64
+	requestLastTine time.Time
+	forwarding bool   // if true we don not check the ip
 }
 
 // Cache is a cache that holds on the a number of RRs or DNS messages. The cache
@@ -32,19 +35,61 @@ type Cache struct {
 	m        map[string]*elem
 	AvaliableIps   map[string] bool  // the host alive
 	ttl      time.Duration
+	pickRadomOne bool
+	flushTime time.Duration
+
+}
+
+// every flushTime we radom check 10W record to del expired
+func (c *Cache) flushExpiredCacheElem(){
+
+	for range time.Tick(c.flushTime) {
+
+		c.Lock()
+		maxWalk := len(c.m)
+
+		// 20ms 10W time.Since() calls in vm
+		if maxWalk > 100000{
+			maxWalk = 100000
+		}
+		i :=0
+		for key,e := range(c.m){
+			if time.Since(e.expiration) > 0 {
+				delete(c.m, key)
+				i++
+			}
+			maxWalk --
+			if maxWalk ==0{
+				break
+			}
+		}
+		c.Unlock()
+		if i >0{
+			glog.Infof("%d elem exprired \n",i)
+		}
+        }
 }
 
 // New returns a new cache with the capacity and the ttl specified.
-func New(capacity, ttl int) *Cache {
+func New(capacity, ttl int, flush int,radomOne bool) *Cache {
 	c := new(Cache)
 	c.m = make(map[string]*elem)
 	c.AvaliableIps = make(map[string]bool)
 	c.capacity = capacity
 	c.ttl = time.Duration(ttl) * time.Second
+	c.flushTime = time.Duration(flush) * time.Second
+	c.pickRadomOne = radomOne
+	go c.flushExpiredCacheElem()
 	return c
 }
 
 func (c *Cache) Capacity() int { return c.capacity }
+
+func (c *Cache) CacheSizeUsed() int{
+	c.RLock()
+	defer c.RUnlock()
+	return len(c.m)
+}
 
 func (c *Cache) Remove(s string) {
 	c.Lock()
@@ -52,6 +97,30 @@ func (c *Cache) Remove(s string) {
 	c.Unlock()
 }
 
+
+// the key in cache is diff from domain
+func (c *Cache)keyTypeA(name string, dnssec, tcp bool) string {
+	h := sha1.New()
+	i := append([]byte(name), packUint16(dns.TypeA)...)
+	if dnssec {
+		i = append(i, byte(255))
+	}
+	if tcp {
+		i = append(i, byte(254))
+	}
+	return string(h.Sum(i))
+}
+func (c *Cache) ShowCacheStats(domain string,tcp bool) (int64, time.Time){
+	//udp
+	c.RLock()
+	defer c.RUnlock()
+	key := c.keyTypeA(domain,false,tcp)
+	if e, ok := c.m[key]; ok {
+		return e.requestCount, e.requestLastTine
+	}else{
+		return 0,time.Time{}
+	}
+}
 // the key in cache is diff from domain
 func (c *Cache)keyExtendTypeA(name string, dnssec, tcp bool) string {
 	h := sha1.New()
@@ -182,15 +251,15 @@ func (c *Cache) UpdateRcacheDelete(valA interface{}) {
 		e.Unlock()
 	}
 }
-// EvictRandom removes a random member a the cache.
+// EvictRandom removes a 100 member a the cache.
 // Must be called under a write lock.
 func (c *Cache) EvictRandom() {
 	clen := len(c.m)
-	if clen < c.capacity + 100{
+	if clen < c.capacity + 100 {
 		return
 	}
 	i := clen - c.capacity
-	for k,_ := range c.m {
+	for k, _ := range c.m {
 		delete(c.m, k)
 		i--
 		if i == 0 {
@@ -201,7 +270,7 @@ func (c *Cache) EvictRandom() {
 
 // InsertMessage inserts a message in the Cache. We will cache it for ttl seconds, which
 // should be a small (60...300) integer.
-func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string) {
+func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow time.Time,forwarding bool) {
 	if c.capacity <= 0 {
 		return
 	}
@@ -209,6 +278,9 @@ func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string) {
 	if _, ok := c.m[s]; !ok {
 		elm := &elem{expiration:time.Now().UTC().Add(c.ttl), msg:msg.Copy()}
 		elm.mAnswer = make(map[string][]dns.RR)
+		elm.requestCount =1
+		elm.requestLastTine = timeNow
+		elm.forwarding = forwarding
 		c.m[s] = elm
 		if len(msg.Answer) > 0 {
 			c.cacheMsgPack(elm, msg, remoteIp)
@@ -240,10 +312,17 @@ func (c *Cache) InsertSignature(s string, sig *dns.RRSIG) {
 // pack the msg return the pre svc ip or the random one
 
 func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
+	if ! c.pickRadomOne{
+		return
+	}
 	//if has pre query value return pre
 	e.Lock()
 	defer e.Unlock()
 	if answer, ok := e.mAnswer[remoteIp]; ok {
+		if e.forwarding{
+			msg.Answer = answer
+			return
+		}
 		// check avliable
 		avliable  := false
 		for _, r := range answer{
@@ -275,9 +354,14 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 				}
 				valA := r.(*dns.A)
 				key := valA.A.String()
-				if _,e:= c.AvaliableIps[key]; e{
+				if ! e.forwarding{
+					if _,e:= c.AvaliableIps[key]; e{
+						ips = append(ips,i)
+					}
+				}else{
 					ips = append(ips,i)
 				}
+
 		 	case *dns.CNAME:
 				e.mAnswer[remoteIp] = append(e.mAnswer[remoteIp] ,r)
 			 // other type return org val
@@ -303,12 +387,14 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 
 // Search returns a dns.Msg, the expiration time and a boolean indicating if we found something
 // in the cache.
-func (c *Cache) DoSearch(s string,remoteIp string) (*dns.Msg, time.Time, bool) {
+func (c *Cache) DoSearch(s string,remoteIp string,queryNow time.Time) (*dns.Msg, time.Time, bool) {
 	if c.capacity <= 0 {
 		return nil, time.Time{}, false
 	}
 	c.RLock()
 	if e, ok := c.m[s]; ok {
+		e.requestLastTine = queryNow
+		e.requestCount++
 		e1 := e.msg.Copy()
 		if len(e1.Answer) > 0 {
 			c.cacheMsgPack(e, e1, remoteIp)
@@ -331,39 +417,9 @@ func Key(q dns.Question, tcp bool) string {
 	return string(h.Sum(i))
 }
 
-// Key uses the name, type and rdata, which is serialized and then hashed as the key for the lookup.
-func KeyRRset(rrs []dns.RR) string {
-	h := sha1.New()
-	i := []byte(rrs[0].Header().Name)
-	i = append(i, packUint16(rrs[0].Header().Rrtype)...)
-	for _, r := range rrs {
-		switch t := r.(type) { // we only do a few type, serialize these manually
-		case *dns.SOA:
-			// We only fiddle with the serial so store that.
-			i = append(i, packUint32(t.Serial)...)
-		case *dns.SRV:
-			i = append(i, packUint16(t.Priority)...)
-			i = append(i, packUint16(t.Weight)...)
-			i = append(i, packUint16(t.Weight)...)
-			i = append(i, []byte(t.Target)...)
-		case *dns.A:
-			i = append(i, []byte(t.A)...)
-		case *dns.AAAA:
-			i = append(i, []byte(t.AAAA)...)
-		case *dns.NSEC3:
-			i = append(i, []byte(t.NextDomain)...)
-			// Bitmap does not differentiate in HADES.
-		case *dns.DNSKEY:
-		case *dns.NS:
-		case *dns.TXT:
-		}
-	}
-	return string(h.Sum(i))
-}
-
-func (c *Cache) Search(question dns.Question, tcp bool, msgid uint16,remoteIp string) *dns.Msg {
+func (c *Cache) Search(question dns.Question, tcp bool, msgid uint16,remoteIp string,queryNow time.Time) *dns.Msg {
 	key := Key(question, tcp)
-	m1, exp, hit := c.DoSearch(key,remoteIp)
+	m1, exp, hit := c.DoSearch(key,remoteIp,queryNow)
 	if hit {
 		// Cache hit! \o/
 		if time.Since(exp) < 0 {
@@ -380,4 +436,4 @@ func (c *Cache) Search(question dns.Question, tcp bool, msgid uint16,remoteIp st
 }
 
 func packUint16(i uint16) []byte { return []byte{byte(i >> 8), byte(i)} }
-func packUint32(i uint32) []byte { return []byte{byte(i >> 24), byte(i >> 16), byte(i >> 8), byte(i)} }
+

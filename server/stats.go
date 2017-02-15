@@ -6,107 +6,127 @@ package server
 
 import (
 	"net/http"
-	"strconv"
-	"time"
-	"github.com/miekg/dns"
+	"net"
+	"fmt"
+	"encoding/json"
 	"github.com/golang/glog"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/gorilla/mux"
+	"time"
+	"strings"
 )
-
 var (
-	promExternalRequestCount *prometheus.CounterVec
-	promRequestCount         *prometheus.CounterVec
-	promErrorCount           *prometheus.CounterVec
-	promCacheMiss            *prometheus.CounterVec
-	promRequestDuration      *prometheus.HistogramVec
-	promResponseSize         *prometheus.HistogramVec
+	statsErrorCountRefused int64 = 0
+	statsErrorCountOverflow int64 = 0
+	statsErrorCountTruncated int64 = 0
+	statsErrorCountServfail  int64 =0
+	statsErrorCountNoname    int64 =0
+
+	statsRequestCountTcp   int64 = 0
+	statsRequestCountUdp   int64 = 0
+	statsRequestCount      int64 = 0
+	statsForwardCount      int64 = 0
+	statsCacheMissResponse int64 = 0
+
+	statsStubForwardCount   int64 =0
+
+	statsNoDataCount int64 = 0
+
+	statsDnssecOkCount  int64 = 0
+	statsDnssecCacheMiss int64 = 0
 )
 
-// Metrics registers the DNS metrics to Prometheus, and starts the internal metrics
-// server if the environment variable PROMETHEUS_PORT is set.
-func Metrics(metricsPort string) {
+var statsAuthToken     = ""
+type comStats struct {
+	RequestCount int64 `json:"reqCount,omitempty"`
+	ForwardCount int64 `json:"forwardCount,omitempty"`
+	CacheMissCount int64 `json:"cacheMissCount,omitempty"`
+	CacheSizeUsed int `json:"cacheSizeUsed,omitempty"`
 
-	RegisterMetrics("hades")
+	ErrorCountNoname int64 `json:"noNameCount,omitempty"`
+	ErrorCountOverflow int64 `json:"overFlowCount,omitempty"`
+	ErrorNoDataCount int64 `json:"noDataCount,omitempty"`
 
-	if metricsPort == "" {
+}
+type domainStats struct {
+	RequestCount int64 `json:"reqCount,omitempty"`
+	LastQueryTime time.Time `json:"lastQueryTime,omitempty"`
+}
+
+func (s *server) statsList(w http.ResponseWriter, r *http.Request){
+
+        if ! s.statsAuthorization(w,r){
 		return
 	}
+	var sta comStats
+	sta.RequestCount = statsRequestCount
+	sta.ForwardCount = statsForwardCount
+	sta.CacheMissCount = statsCacheMissResponse
+	sta.CacheSizeUsed = s.rcache.CacheSizeUsed()
 
-	_, err := strconv.Atoi(metricsPort)
+	sta.ErrorCountNoname = statsErrorCountNoname
+	sta.ErrorCountOverflow = statsErrorCountOverflow
+	sta.ErrorNoDataCount = statsNoDataCount
+
+	b, err := json.Marshal(sta)
 	if err != nil {
-		glog.Fatalf("bad port for prometheus: %s", metricsPort)
+		fmt.Fprintf(w, "%s\n",err.Error())
+		return
 	}
-
-	http.Handle("/metrics", prometheus.Handler())
-	go func() {
-		glog.Fatalf("%s", http.ListenAndServe(":"+metricsPort, nil))
-	}()
-	glog.Infof("metrics enabled on :%s%s", metricsPort, "/metrics")
-}
-
-// RegisterMetrics registers DNS specific Prometheus metrics with the provided namespace
-// and subsystem.
-func RegisterMetrics( prometheusSubsystem string) {
-	promRequestCount = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Subsystem: prometheusSubsystem,
-		Name:      "dns_request_count",
-		Help:      "Counter of DNS requests made.",
-	}, []string{"type"}) // udp, tcp
-	prometheus.MustRegister(promRequestCount)
-
-	promErrorCount = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Subsystem: prometheusSubsystem,
-		Name:      "dns_error_count",
-		Help:      "Counter of DNS requests resulting in an error.",
-	}, []string{"error"}) // nxdomain, nodata, truncated, refused, overflow
-	prometheus.MustRegister(promErrorCount)
-
-	promCacheMiss = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Subsystem: prometheusSubsystem,
-		Name:      "dns_cache_miss_count",
-		Help:      "Counter of DNS requests that result in a cache miss.",
-	}, []string{"type"}) // response, signature
-	prometheus.MustRegister(promCacheMiss)
-
-	promRequestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Subsystem: prometheusSubsystem,
-		Name:      "dns_request_duration",
-		Help:      "Histogram of the time (in seconds) each request took to resolve.",
-		Buckets:   append([]float64{0.001, 0.003}, prometheus.DefBuckets...),
-	}, []string{"type"}) // udp, tcp
-	prometheus.MustRegister(promRequestDuration)
-
-	promResponseSize = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Subsystem: prometheusSubsystem,
-		Name:      "dns_response_size",
-		Help:      "Size of the returns response in bytes.",
-		// 4k increments after 4096
-		Buckets: []float64{0, 512, 1024, 1500, 2048, 4096,
-			8192, 12288, 16384, 20480, 24576, 28672, 32768, 36864,
-			40960, 45056, 49152, 53248, 57344, 61440, 65536,
-		},
-	}, []string{"type"}) // udp, tcp
-	prometheus.MustRegister(promResponseSize)
-
-	promExternalRequestCount = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Subsystem: prometheusSubsystem,
-		Name:      "dns_request_external_count",
-		Help:      "Counter of external DNS requests.",
-	}, []string{"type"}) // recursive, stub, lookup
-	prometheus.MustRegister(promExternalRequestCount)
+	fmt.Fprintf(w, "%s\n",string(b))
 
 }
 
-// metricSizeAndDuration sets the size and duration metrics.
-func metricSizeAndDuration(resp *dns.Msg, start time.Time, tcp bool) {
-	net := "udp"
-	rlen := float64(0)
-	if tcp {
-		net = "tcp"
+func (s *server) statsAuthorization(w http.ResponseWriter, r *http.Request)bool{
+	val,ok := r.Header["Token"]
+	if !ok{
+		fmt.Fprintf(w, "%s\n","No Authorization")
+		return false
 	}
-	if resp != nil {
-		rlen = float64(resp.Len())
+	if strings.Compare(val[0], statsAuthToken) != 0 {
+		fmt.Fprintf(w, "%s\n","Authorization ERR")
+		return false
 	}
-	promRequestDuration.WithLabelValues(net).Observe(float64(time.Since(start)) / float64(time.Second))
-	promResponseSize.WithLabelValues(net).Observe(rlen)
+	return true
+}
+func (s *server) statsShowCache(w http.ResponseWriter, r *http.Request){
+        if ! s.statsAuthorization(w,r){
+		return
+	}
+	var sta domainStats
+	//udp
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	countUdp,lasttime  := s.rcache.ShowCacheStats(domain,false)
+	if countUdp  == 0{
+		fmt.Fprintf(w, "%s\n","domain not found")
+		return
+	}
+	sta.LastQueryTime = lasttime
+	sta.RequestCount  = countUdp
+	b, err := json.Marshal(sta)
+	if err != nil {
+		fmt.Fprintf(w, "%s\n",err.Error())
+		return
+	}
+	fmt.Fprintf(w, "%s\n",string(b))
+}
+func (s *server) Statistics(stAddr string,auth string) {
+	if stAddr ==""{
+		return
+	}
+	statsAuthToken = auth
+	_, err := net.Dial("tcp", stAddr)
+       if err == nil {
+           glog.Fatalf("statics the addr is used:%s\n",stAddr)
+       }
+	r := mux.NewRouter()
+	r.HandleFunc("/hades/stats", s.statsList).Methods("GET")
+	r.HandleFunc("/hades/stats/{domain}", s.statsShowCache).Methods("GET")
+
+	glog.Infof("statistics enabled on :%s", stAddr)
+	err = http.ListenAndServe(stAddr, r)
+	if err != nil{
+		panic(fmt.Sprintf("Failed to start API service:%s", err))
+	}
+
 }
