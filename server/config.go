@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"fmt"
 )
 
 const (
@@ -98,6 +99,10 @@ func SetDefaults(config *Config) error {
 	config.Domain = dns.Fqdn(strings.ToLower(config.Domain))
         config.dnsDomain = appendDomain("ns.dns", config.Domain)
  	config.hostMaster = "hostmaster@"+  config.Domain
+
+	if !strings.HasSuffix(config.IpMonitorPath, "/") {
+		config.IpMonitorPath = fmt.Sprintf("%s/", config.IpMonitorPath)
+	}
 	return nil
 }
 
