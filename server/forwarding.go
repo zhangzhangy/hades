@@ -28,7 +28,7 @@ func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg,remoteIp str
 		m.SetReply(req)
 		m.SetRcode(req, dns.RcodeServerFailure)
 		m.Authoritative = false     // no matter what set to false
-		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp),m,remoteIp,timeNow)
+		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp),m,remoteIp,timeNow,true)
 		m.RecursionAvailable = true // and this is still true
 		w.WriteMsg(m)
 		return m
@@ -51,7 +51,7 @@ Redo:
 	if err == nil {
 		r.Compress = true
 		r.Id = req.Id
-		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp), r,remoteIp,timeNow)
+		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp), r,remoteIp,timeNow,true)
 		w.WriteMsg(r)
 		return r
 	}
@@ -67,7 +67,7 @@ Redo:
 	m := new(dns.Msg)
 	m.SetReply(req)
 	m.SetRcode(req, dns.RcodeServerFailure)
-	s.rcache.InsertMessage(cache.Key(req.Question[0], tcp),m,remoteIp,timeNow)
+	s.rcache.InsertMessage(cache.Key(req.Question[0], tcp),m,remoteIp,timeNow,true)
 	w.WriteMsg(m)
 	return m
 }
@@ -83,7 +83,7 @@ func (s *server) ServeDNSReverse(w dns.ResponseWriter, req *dns.Msg,remoteIp str
 	if m.Answer, err = s.PTRRecords(req.Question[0]); err == nil {
 		// Probably not worth the hassle?
 		tcp := isTCP(w)
-		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp), m,remoteIp,timeNow)
+		s.rcache.InsertMessage(cache.Key(req.Question[0], tcp), m,remoteIp,timeNow,true)
 		if err := w.WriteMsg(m); err != nil {
 			glog.Infof("failure to return reply %q", err)
 		}

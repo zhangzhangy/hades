@@ -392,7 +392,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 				statsErrorCountTruncated++
 			}
 		}
-		s.rcache.InsertMessage(cache.Key(q, tcp), m,remoteIp[0],timeNow)
+		s.rcache.InsertMessage(cache.Key(q, tcp), m,remoteIp[0],timeNow,false)
 
 		if err := w.WriteMsg(m); err != nil {
 			glog.Infof("failure to return reply %q", err)

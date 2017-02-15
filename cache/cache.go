@@ -24,6 +24,7 @@ type elem struct {
 	mAnswer    map[string][]dns.RR // keep to return the pre RR for
 	requestCount int64
 	requestLastTine time.Time
+	forwarding bool   // if true we don not check the ip
 }
 
 // Cache is a cache that holds on the a number of RRs or DNS messages. The cache
@@ -269,7 +270,7 @@ func (c *Cache) EvictRandom() {
 
 // InsertMessage inserts a message in the Cache. We will cache it for ttl seconds, which
 // should be a small (60...300) integer.
-func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow time.Time) {
+func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow time.Time,forwarding bool) {
 	if c.capacity <= 0 {
 		return
 	}
@@ -279,6 +280,7 @@ func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow t
 		elm.mAnswer = make(map[string][]dns.RR)
 		elm.requestCount =1
 		elm.requestLastTine = timeNow
+		elm.forwarding = forwarding
 		c.m[s] = elm
 		if len(msg.Answer) > 0 {
 			c.cacheMsgPack(elm, msg, remoteIp)
@@ -317,6 +319,10 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 	e.Lock()
 	defer e.Unlock()
 	if answer, ok := e.mAnswer[remoteIp]; ok {
+		if e.forwarding{
+			msg.Answer = answer
+			return
+		}
 		// check avliable
 		avliable  := false
 		for _, r := range answer{
@@ -348,9 +354,14 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 				}
 				valA := r.(*dns.A)
 				key := valA.A.String()
-				if _,e:= c.AvaliableIps[key]; e{
+				if ! e.forwarding{
+					if _,e:= c.AvaliableIps[key]; e{
+						ips = append(ips,i)
+					}
+				}else{
 					ips = append(ips,i)
 				}
+
 		 	case *dns.CNAME:
 				e.mAnswer[remoteIp] = append(e.mAnswer[remoteIp] ,r)
 			 // other type return org val
