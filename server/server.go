@@ -282,7 +282,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	m.Compress = true
 	bufsize := uint16(512)
 	tcp := false
-	timeNow := time.Now().UTC()
+	timeNow := time.Now().Local()
 
 	q := req.Question[0]
 	name := strings.ToLower(q.Name)
