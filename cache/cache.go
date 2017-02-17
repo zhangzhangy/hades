@@ -96,7 +96,20 @@ func (c *Cache) Remove(s string) {
 	delete(c.m, s)
 	c.Unlock()
 }
-
+func (c *Cache)EnsureNoExist(name string,qtype  uint16, tcp bool)  {
+	h := sha1.New()
+	i := append([]byte(name), packUint16(qtype)...)
+	if tcp {
+		i = append(i, byte(254))
+	}
+	key:= string(h.Sum(i))
+	c.Lock()
+	if _, ok := c.m[key]; ok {
+		glog.V(2).Infof("del key =%s type =%d\n",key,qtype)
+		delete(c.m, key)
+	}
+	c.Unlock()
+}
 
 // the key in cache is diff from domain
 func (c *Cache)keyTypeA(name string, dnssec, tcp bool) string {
@@ -255,10 +268,10 @@ func (c *Cache) UpdateRcacheDelete(valA interface{}) {
 // Must be called under a write lock.
 func (c *Cache) EvictRandom() {
 	clen := len(c.m)
-	if clen < c.capacity + 100 {
+	if clen < c.capacity {
 		return
 	}
-	i := clen - c.capacity
+	i := 100
 	for k, _ := range c.m {
 		delete(c.m, k)
 		i--

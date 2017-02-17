@@ -48,6 +48,8 @@ type Config struct {
 	RadomOne bool `json:"radom-one,omitempty"`
 	MetricsPort string `json:"metrics_port,omitempty"`
         dnsDomain   string // "ns.dns". + config.Domain
+	mailDomain   string // "mail". + config.Domain
+	txtDomain   string // "txt". + config.Domain
 	hostMaster   string // "ns.dns". + config.Domain
 	// RCacheTtl, how long to cache in seconds.
 	RCacheFlush int `json:"rcache_flush,omitempty"`
@@ -98,6 +100,8 @@ func SetDefaults(config *Config) error {
 	}
 	config.Domain = dns.Fqdn(strings.ToLower(config.Domain))
         config.dnsDomain = appendDomain("ns.dns", config.Domain)
+	config.mailDomain = appendDomain("mail", config.Domain)
+	config.txtDomain = appendDomain("txt", config.Domain)
  	config.hostMaster = "hostmaster@"+  config.Domain
 
 	if !strings.HasSuffix(config.IpMonitorPath, "/") {
