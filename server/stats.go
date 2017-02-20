@@ -96,6 +96,9 @@ func (s *server) statsShowCache(w http.ResponseWriter, r *http.Request){
 	//udp
 	vars := mux.Vars(r)
 	domain := vars["domain"]
+	if !strings.HasSuffix(domain, ".") {
+		domain = fmt.Sprintf("%s.",domain)
+	}
 	countUdp,lasttime  := s.rcache.ShowCacheStats(domain,false)
 	if countUdp  == 0{
 		fmt.Fprintf(w, "%s\n","domain not found")

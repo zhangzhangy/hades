@@ -157,10 +157,27 @@ func (s *server) updateRcacheParseRecord(node *etcd.Node) interface{} {
 
   	return nil
 }
-
+func (s *server) checkUpdateRcacheDir(resp *etcd.Response)(bool){
+	// if /hades/local/hades/dns txt mail retrun true
+	domaiNanme := msg.Domain(resp.Node.Key)
+	if strings.HasSuffix(domaiNanme,s.config.dnsDomain){
+		s.rcache.EnsureNoExist(s.config.Domain,dns.TypeNS ,false)
+		return true
+	}else if strings.HasSuffix(domaiNanme,s.config.mailDomain){
+		s.rcache.EnsureNoExist(s.config.Domain,dns.TypeMX ,false)
+		return true
+	}else if strings.HasSuffix(domaiNanme,s.config.txtDomain){
+		s.rcache.EnsureNoExist(s.config.Domain,dns.TypeTXT ,false)
+		return true
+	}else{
+		return false
+	}
+}
 func (s *server) UpdateRcache(resp *etcd.Response) {
         glog.V(2).Infof("UpdateRcache: Action =%s Key=%s", resp.Action, resp.Node.Key)
-
+        if s.checkUpdateRcacheDir(resp){
+		return
+	}
 	switch strings.ToLower(resp.Action){
 		case "create":
 			fallthrough
@@ -282,7 +299,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	m.Compress = true
 	bufsize := uint16(512)
 	tcp := false
-	timeNow := time.Now().UTC()
+	timeNow := time.Now().Local()
 
 	q := req.Question[0]
 	name := strings.ToLower(q.Name)
@@ -479,7 +496,10 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 
 	case dns.TypeTXT:
-		records, err := s.TXTRecords(q, name)
+		if name != s.config.Domain {
+			break
+		}
+		records, err := s.TXTRecords(q, s.config.txtDomain)
 		if isEtcdNameError(err, s) {
 			s.NameError(m, req)
 			return
@@ -493,7 +513,10 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		}
 		m.Answer = append(m.Answer, records...)
 	case dns.TypeMX:
-		records, extra, err := s.MXRecords(q, name, bufsize)
+		if name != s.config.Domain {
+			break
+		}
+		records, extra, err := s.MXRecords(q, s.config.mailDomain, bufsize)
 		if isEtcdNameError(err, s) {
 			s.NameError(m, req)
 			return
