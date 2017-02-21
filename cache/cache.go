@@ -268,7 +268,7 @@ func (c *Cache) UpdateRcacheDelete(valA interface{}) {
 // Must be called under a write lock.
 func (c *Cache) EvictRandom() {
 	clen := len(c.m)
-	if clen < c.capacity {
+	if clen <= c.capacity {
 		return
 	}
 	i := 100
@@ -285,6 +285,12 @@ func (c *Cache) EvictRandom() {
 // should be a small (60...300) integer.
 func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow time.Time,forwarding bool) {
 	if c.capacity <= 0 {
+		if  c.pickRadomOne &&  len(msg.Answer) > 0{
+			Answer := c.pickRadomOneFun(msg,remoteIp,forwarding)
+			if len(Answer) > 0{
+				msg.Answer = Answer
+			}
+		}
 		return
 	}
 	c.Lock()
@@ -322,40 +328,11 @@ func (c *Cache) InsertSignature(s string, sig *dns.RRSIG) {
 	c.Unlock()
 }
 
+
 // pack the msg return the pre svc ip or the random one
-
-func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
-	if ! c.pickRadomOne{
-		return
-	}
-	//if has pre query value return pre
-	e.Lock()
-	defer e.Unlock()
-	if answer, ok := e.mAnswer[remoteIp]; ok {
-		if e.forwarding{
-			msg.Answer = answer
-			return
-		}
-		// check avliable
-		avliable  := false
-		for _, r := range answer{
-			if valA ,ok := r.(*dns.A); ok{
-				key := valA.A.String()
-				if _,e:= c.AvaliableIps[key]; e{
-					avliable = true
-				}
-			}
-		}
-            if avliable{
-		    msg.Answer = answer
-		    return
-	    }else{
-		    delete(e.mAnswer,remoteIp )
-	    }
-	}
-	//Cname return many vals : aliases names and svcip ; others just svc ip
+func (c *Cache) pickRadomOneFun(msg *dns.Msg,remoteIp string, forwarding bool)( []dns.RR ){
 	var ips []int
-
+	var mAnswer []dns.RR
 	// when each ip is not avaliable retrun the fist one
 	ensureOneIp := 0
 	for i, r := range msg.Answer {
@@ -367,7 +344,7 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 				}
 				valA := r.(*dns.A)
 				key := valA.A.String()
-				if ! e.forwarding{
+				if ! forwarding{
 					if _,e:= c.AvaliableIps[key]; e{
 						ips = append(ips,i)
 					}
@@ -376,10 +353,11 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 				}
 
 		 	case *dns.CNAME:
-				e.mAnswer[remoteIp] = append(e.mAnswer[remoteIp] ,r)
+				mAnswer = append(mAnswer ,r)
 			 // other type return org val
 		    default:
-			 	return
+			    var mAnswerNop []dns.RR
+			    return mAnswerNop
 
 		 }
 	}
@@ -387,14 +365,49 @@ func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string){
 	if len(ips) ==0{
 		ips = append(ips,ensureOneIp)
 	}
+
 	h := fnv.New32a()
 	h.Write([]byte(remoteIp))
 	idx := int(h.Sum32()) % len(ips)
 	answerNew := msg.Answer[ips[idx]]
+	mAnswer = append(mAnswer,answerNew)
+	return mAnswer
+}
 
-	e.mAnswer[remoteIp] = append(e.mAnswer[remoteIp] ,answerNew)
-	msg.Answer = e.mAnswer[remoteIp]
-
+func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string) {
+	if ! c.pickRadomOne {
+		return
+	}
+	//if has pre query value return pre
+	e.Lock()
+	defer e.Unlock()
+	if answer, ok := e.mAnswer[remoteIp]; ok {
+		if e.forwarding {
+			msg.Answer = answer
+			return
+		}
+		// check avliable
+		avliable := false
+		for _, r := range answer {
+			if valA, ok := r.(*dns.A); ok {
+				key := valA.A.String()
+				if _, e := c.AvaliableIps[key]; e {
+					avliable = true
+				}
+			}
+		}
+		if avliable {
+			msg.Answer = answer
+			return
+		} else {
+			delete(e.mAnswer, remoteIp)
+		}
+	}
+	Answer := c.pickRadomOneFun(msg, remoteIp, e.forwarding)
+	if len(Answer )> 0 {
+		e.mAnswer[remoteIp] = Answer[:]
+		msg.Answer = Answer
+	}
 	return
 }
 
