@@ -17,7 +17,9 @@ then the user accessthe domain later, the user will get the same service ip.
 * `hades-kubeapi`: monitor the changes of k8s services, and record the change in the etcd. It offered the
    original data for hades, meanwhille hades-kubeapi offers the resful api for users to maintain domain records.
 * `hades-apicmd`: it is a shell cmd for user to query\update domain record, it is based on hades-kubeapi.
- 
+
+##Design Architecture
+  ![image](https://github.com/ipdcode/hades/blob/master/images/hades_design_architecture.png)
 
 ## Setup / Install
 
