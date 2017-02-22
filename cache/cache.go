@@ -286,10 +286,12 @@ func (c *Cache) EvictRandom() {
 func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow time.Time,forwarding bool) {
 	if c.capacity <= 0 {
 		if  c.pickRadomOne &&  len(msg.Answer) > 0{
+			c.Lock()
 			Answer := c.pickRadomOneFun(msg,remoteIp,forwarding)
 			if len(Answer) > 0{
 				msg.Answer = Answer
 			}
+			c.Unlock()
 		}
 		return
 	}
@@ -334,12 +336,12 @@ func (c *Cache) pickRadomOneFun(msg *dns.Msg,remoteIp string, forwarding bool)( 
 	var ips []int
 	var mAnswer []dns.RR
 	// when each ip is not avaliable retrun the fist one
-	ensureOneIp := 0
+	ensureOneIp := -1
 	for i, r := range msg.Answer {
 		 switch r.(type) {
 		 	case *dns.A:
 				// choose the first one
-				if ensureOneIp ==0{
+				if ensureOneIp < 0{
 					ensureOneIp = i
 				}
 				valA := r.(*dns.A)
@@ -360,6 +362,10 @@ func (c *Cache) pickRadomOneFun(msg *dns.Msg,remoteIp string, forwarding bool)( 
 			    return mAnswerNop
 
 		 }
+	}
+	// no typeA result
+	if ensureOneIp <0{
+		return mAnswer
 	}
 	// no hosts avaluable choose one
 	if len(ips) ==0{
