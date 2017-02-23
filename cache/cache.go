@@ -21,7 +21,9 @@ type elem struct {
 	sync.Mutex
 	expiration time.Time // time added + TTL, after this the elem is invalid
 	msg        *dns.Msg
-	mAnswer    map[string][]dns.RR // keep to return the pre RR for
+	mAnswer    map[string]int // keep to return the pre ip
+	ips  []dns.RR             //msg typeA records
+	cnames []dns.RR            //msg cname records
 	requestCount int64
 	requestLastTine time.Time
 	forwarding bool   // if true we don not check the ip
@@ -36,6 +38,7 @@ type Cache struct {
 	AvaliableIps   map[string] bool  // the host alive
 	ttl      time.Duration
 	pickRadomOne bool
+	ipHold       bool
 	flushTime time.Duration
 
 }
@@ -71,11 +74,12 @@ func (c *Cache) flushExpiredCacheElem(){
 }
 
 // New returns a new cache with the capacity and the ttl specified.
-func New(capacity, ttl int, flush int,radomOne bool) *Cache {
+func New(capacity, ttl int, flush int,radomOne bool,ipHold bool ) *Cache {
 	c := new(Cache)
 	c.m = make(map[string]*elem)
 	c.AvaliableIps = make(map[string]bool)
 	c.capacity = capacity
+	c.ipHold    = ipHold
 	c.ttl = time.Duration(ttl) * time.Second
 	c.flushTime = time.Duration(flush) * time.Second
 	c.pickRadomOne = radomOne
@@ -168,7 +172,7 @@ func (c *Cache) checkCacheExitst(r interface{} ) (valueIdx int,keyExist bool,key
 		return valueIdx,keyExist,key
 	}
 	valueIdx = 0
-	key = c.keyExtendTypeA(nameR, false,false)
+	key = c.keyTypeA(nameR, false,false)
 	if e, ok := c.m[key]; ok {
 		keyExist = true
 		// Cname match specal value -1
@@ -212,13 +216,21 @@ func (c *Cache) UpdateRcacheSet(val interface{}) {
 		return
 	}
 	c.Lock()
+	defer c.Unlock()
 	_, find, matchKey:= c.checkCacheExitst(valA)
 	if find{
 		//type A update the  Ansers
 		e := c.m[matchKey]
+		// pre nodata
+		if len(e.msg.Answer) == 0{
+			delete(c.m, matchKey)
+			return
+		}
 		e.msg.Answer = append(e.msg.Answer, valA)
+		e.Lock()
+		e.mAnswer = make(map[string]int)
+		e.Unlock()
 	}
-	c.Unlock()
 }
 
 func (c *Cache) UpdateRcacheUpdate(valAOld interface{}, valANew interface{} ) {
@@ -238,7 +250,7 @@ func (c *Cache) UpdateRcacheUpdate(valAOld interface{}, valANew interface{} ) {
 		e.msg.Answer[idx] = valANew.(*dns.A)
 		//del the old val from dict
 		e.Lock()
-		c.delValFromDictL2(valAOld.(*dns.A), e.mAnswer)
+		e.mAnswer = make(map[string]int)
 		e.Unlock()
 	}
 }
@@ -258,9 +270,13 @@ func (c *Cache) UpdateRcacheDelete(valA interface{}) {
 		e := c.m[matchKey]
 
 		e.msg.Answer = append(e.msg.Answer[:idx], e.msg.Answer[idx+1:]...)
-		//del from dict
+		if len(e.msg.Answer)==0{
+			delete(c.m, matchKey)
+			return
+		}
+		//del l2 dict
 		e.Lock()
-		c.delValFromDictL2(valA.(*dns.A), e.mAnswer)
+		e.mAnswer = make(map[string]int)
 		e.Unlock()
 	}
 }
@@ -285,20 +301,25 @@ func (c *Cache) EvictRandom() {
 // should be a small (60...300) integer.
 func (c *Cache) InsertMessage(s string, msg *dns.Msg, remoteIp string, timeNow time.Time,forwarding bool) {
 	if c.capacity <= 0 {
-		if  c.pickRadomOne &&  len(msg.Answer) > 0{
-			c.Lock()
-			Answer := c.pickRadomOneFun(msg,remoteIp,forwarding)
-			if len(Answer) > 0{
-				msg.Answer = Answer
+		if  len(msg.Answer) > 0{
+			c.RLock()
+			if ! c.pickRadomOne && !c.ipHold {
+				c.Unlock()
+				return
 			}
-			c.Unlock()
+			tyC ,a,idx := c.pickRadomOneFun(msg,remoteIp,forwarding)
+			newAnswer,_ := c.doMsgPack(tyC,a,idx,forwarding)
+			if len(newAnswer) >0 {
+				msg.Answer = newAnswer
+			}
+			c.RUnlock()
 		}
 		return
 	}
 	c.Lock()
 	if _, ok := c.m[s]; !ok {
 		elm := &elem{expiration:time.Now().UTC().Add(c.ttl), msg:msg.Copy()}
-		elm.mAnswer = make(map[string][]dns.RR)
+		elm.mAnswer = make(map[string]int)
 		elm.requestCount =1
 		elm.requestLastTine = timeNow
 		elm.forwarding = forwarding
@@ -332,9 +353,10 @@ func (c *Cache) InsertSignature(s string, sig *dns.RRSIG) {
 
 
 // pack the msg return the pre svc ip or the random one
-func (c *Cache) pickRadomOneFun(msg *dns.Msg,remoteIp string, forwarding bool)( []dns.RR ){
+func (c *Cache) pickRadomOneFun(msg *dns.Msg,remoteIp string, forwarding bool)( []dns.RR ,[]dns.RR ,int ){
+	var ipsRecords []dns.RR
 	var ips []int
-	var mAnswer []dns.RR
+	var cnamesRecords []dns.RR
 	// when each ip is not avaliable retrun the fist one
 	ensureOneIp := -1
 	for i, r := range msg.Answer {
@@ -349,70 +371,127 @@ func (c *Cache) pickRadomOneFun(msg *dns.Msg,remoteIp string, forwarding bool)( 
 				if ! forwarding{
 					if _,e:= c.AvaliableIps[key]; e{
 						ips = append(ips,i)
+						ipsRecords = append(ipsRecords,r)
 					}
 				}else{
+					ipsRecords = append(ipsRecords,r)
 					ips = append(ips,i)
 				}
 
 		 	case *dns.CNAME:
-				mAnswer = append(mAnswer ,r)
+				cnamesRecords = append(cnamesRecords,r)
 			 // other type return org val
 		    default:
-			    var mAnswerNop []dns.RR
-			    return mAnswerNop
+			    var recordNop []dns.RR
+			    return recordNop,recordNop, -1
 
 		 }
 	}
 	// no typeA result
 	if ensureOneIp <0{
-		return mAnswer
+		return cnamesRecords, ipsRecords,-1
 	}
 	// no hosts avaluable choose one
 	if len(ips) ==0{
+		ipsRecords = append(ipsRecords,msg.Answer[ensureOneIp])
 		ips = append(ips,ensureOneIp)
 	}
 
 	h := fnv.New32a()
 	h.Write([]byte(remoteIp))
 	idx := int(h.Sum32()) % len(ips)
-	answerNew := msg.Answer[ips[idx]]
-	mAnswer = append(mAnswer,answerNew)
-	return mAnswer
+	return cnamesRecords,ipsRecords,idx
+}
+func (c *Cache) findNextActiveIp(ipData[]dns.RR, ipIdx int )( int){
+
+	for i:= ipIdx +1; i <len(ipData); i++{
+		if valA, ok := ipData[i].(*dns.A); ok {
+			key := valA.A.String()
+			if _, e := c.AvaliableIps[key]; e {
+				return i
+			}
+		}
+	}
+	for i:= 0; i < ipIdx; i++{
+		if valA, ok := ipData[i].(*dns.A); ok {
+			key := valA.A.String()
+			if _, e := c.AvaliableIps[key]; e {
+				return i
+			}
+		}
+	}
+	return ipIdx
+}
+
+func (c *Cache) doMsgPack(cnameData []dns.RR ,ipData []dns.RR ,ipIdx int , forwarding bool)([]dns.RR,int){
+	var newAnswer   []dns.RR
+	if len(cnameData) > 0{
+		newAnswer = cnameData[:]
+	}
+	if len(ipData) > 0{
+		if c.pickRadomOne{
+			idxNew := ipIdx
+			if !forwarding{
+				idxNew = c.findNextActiveIp(ipData, ipIdx)
+			}else{
+				idxNew = (ipIdx +1) % len(ipData)
+			}
+			newAnswer = append(newAnswer,ipData[idxNew])
+			return newAnswer,idxNew
+
+		}else if c.ipHold{
+			if valA, ok := ipData[ipIdx].(*dns.A); ok {
+				// forward  not check the ip
+				if forwarding {
+					newAnswer = append(newAnswer, ipData[ipIdx])
+					return newAnswer, ipIdx
+				}
+
+				key := valA.A.String()
+				if _, e := c.AvaliableIps[key]; e {
+					newAnswer = append(newAnswer, ipData[ipIdx])
+					return newAnswer, ipIdx
+				} else {
+					idxNew := c.findNextActiveIp(ipData, ipIdx)
+					newAnswer = append(newAnswer, ipData[idxNew])
+					return newAnswer, idxNew
+				}
+			}
+
+		}else{
+			glog.Infof("doMsgPack callded must with pickRadomOne or c.ipHold  is ture\n")
+		}
+	}
+	return newAnswer, ipIdx
 }
 
 func (c *Cache) cacheMsgPack(e *elem,msg *dns.Msg,remoteIp string) {
-	if ! c.pickRadomOne {
+	if ! c.pickRadomOne && !c.ipHold {
 		return
 	}
-	//if has pre query value return pre
 	e.Lock()
 	defer e.Unlock()
-	if answer, ok := e.mAnswer[remoteIp]; ok {
-		if e.forwarding {
-			msg.Answer = answer
-			return
+	if idx, ok := e.mAnswer[remoteIp]; ok {
+		newAnswer,idxNew := c.doMsgPack(e.cnames,e.ips,idx,e.forwarding)
+		if len(newAnswer) >0{
+			e.mAnswer[remoteIp] = idxNew
+			msg.Answer = newAnswer
 		}
-		// check avliable
-		avliable := false
-		for _, r := range answer {
-			if valA, ok := r.(*dns.A); ok {
-				key := valA.A.String()
-				if _, e := c.AvaliableIps[key]; e {
-					avliable = true
-				}
-			}
-		}
-		if avliable {
-			msg.Answer = answer
-			return
-		} else {
-			delete(e.mAnswer, remoteIp)
-		}
+		return
 	}
-	Answer := c.pickRadomOneFun(msg, remoteIp, e.forwarding)
-	if len(Answer )> 0 {
-		e.mAnswer[remoteIp] = Answer[:]
-		msg.Answer = Answer
+        var newAns []dns.RR
+	cnameR, ipR, idx := c.pickRadomOneFun(msg, remoteIp, e.forwarding)
+	if len(cnameR )> 0 {
+		e.cnames = cnameR[:]
+		newAns   = cnameR
+	}
+	if len(ipR )> 0 {
+		e.ips = ipR[:]
+		e.mAnswer[remoteIp] = idx
+		newAns = append(newAns,e.ips[idx])
+	}
+	if len(newAns) >0{
+		msg.Answer = newAns
 	}
 	return
 }
