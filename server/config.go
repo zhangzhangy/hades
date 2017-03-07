@@ -46,6 +46,7 @@ type Config struct {
 	// How many labels a name should have before we allow forwarding. Default to 2.
 	Ndots int `json:"ndot,omitempty"`
 	RadomOne bool `json:"radom-one,omitempty"`
+	IpHold bool `json:"ipHold,omitempty"`
 	MetricsPort string `json:"metrics_port,omitempty"`
         dnsDomain   string // "ns.dns". + config.Domain
 	mailDomain   string // "mail". + config.Domain
@@ -77,10 +78,10 @@ func SetDefaults(config *Config) error {
 	if config.RCache < 0 {
 		config.RCache = 0
 	}
-	if config.RCacheTtl == 0 {
+	if config.RCacheTtl <= 0 {
 		config.RCacheTtl = RCacheTtl
 	}
-	if config.RCacheFlush == 0 {
+	if config.RCacheFlush <= 0 {
 		config.RCacheTtl = RCacheFlush
 	}
 	if config.Ndots <= 0 {

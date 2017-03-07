@@ -20,7 +20,7 @@ import (
 	"math"
 )
 
-const Version = "1.1.1"
+const Version = "1.1.2"
 
 type server struct {
 	backend Backend
@@ -106,7 +106,7 @@ func New(backend Backend, config *Config) *server {
 		config:  config,
 
 		group:        new(sync.WaitGroup),
-		rcache:       cache.New(config.RCache, config.RCacheTtl,config.RCacheFlush,config.RadomOne),
+		rcache:       cache.New(config.RCache, config.RCacheTtl,config.RCacheFlush,config.RadomOne,config.IpHold),
 		dnsUDPclient: &dns.Client{Net: "udp", ReadTimeout: config.ReadTimeout, WriteTimeout: config.ReadTimeout, SingleInflight: true},
 		dnsTCPclient: &dns.Client{Net: "tcp", ReadTimeout: config.ReadTimeout, WriteTimeout: config.ReadTimeout, SingleInflight: true},
 		ipMonitorPath : config.IpMonitorPath,
@@ -147,9 +147,11 @@ func (s *server) updateRcacheParseRecord(node *etcd.Node) interface{} {
 	switch {
 	case ip == nil:
 		name := s.getSvcCnameName(records[0].Key)
+		name = name[:len(name)-6]
 		return records[0].NewCNAME(name, dns.Fqdn(records[0].Host))
 	case ip.To4() != nil:
 		name := s.getSvcDomainName(records[0].Key)
+		name = name[:len(name)-6]
 		return records[0].NewA(name, ip.To4())
 	default:
 		glog.Infof("updateRcacheParseRecord err \n" )
@@ -354,7 +356,6 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 				statsErrorCountTruncated++
 			}
 		}
-
 		if err := w.WriteMsg(m1); err != nil {
 			glog.Infof("failure to return reply %q", err)
 		}
@@ -374,7 +375,6 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
         statsCacheMissResponse++
 
 	defer func() {
-		glog.V(4).Infof("get  %q: %v \n ", q.Name, m.Answer)
 		if m.Rcode == dns.RcodeServerFailure {
 			if err := w.WriteMsg(m); err != nil {
 				glog.Infof("failure to return reply %q", err)

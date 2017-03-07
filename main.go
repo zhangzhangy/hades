@@ -54,7 +54,8 @@ func init() {
 	flag.IntVar(&config.RCacheTtl, "rcache-ttl", server.RCacheTtl, "TTL of the response cache")
 	flag.StringVar(&statsServer, "statsServer",  "", "hades stats data server like 127.0.0.1:9600")
 	flag.StringVar(&statsServerAuthToken, "statsServerAuthToken",  "@hades.com", "hades stats data server token")
-        flag.BoolVar(&config.RadomOne, "radom-one", false, "piack radom one result for A")
+        flag.BoolVar(&config.RadomOne, "radom-one", false, "pick radom one result for A")
+	flag.BoolVar(&config.IpHold, "ip-hold", false, "pick the last ip(typeA) for the same client")
 
 	flag.IntVar(&config.RCacheFlush, "rcache-flush", server.RCacheFlush, "the duration to flush expired cache out")
 }
@@ -90,6 +91,9 @@ func main() {
 
 	if err := server.SetDefaults(config); err != nil {
 		glog.Fatalf("hades: defaults could not be set from /etc/resolv.conf: %v", err)
+	}
+	if config.IpHold && config.RadomOne{
+		glog.Fatalf("hades: ipHold and radom-one you must chose one or neither, check config file !! \n")
 	}
 
 	backend := backendetcd.NewBackend(client, &backendetcd.Config{
