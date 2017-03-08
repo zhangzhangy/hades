@@ -26,6 +26,7 @@ var (
 	statsRequestCount      int64 = 0
 	statsForwardCount      int64 = 0
 	statsCacheMissResponse int64 = 0
+	statsRequestCountCached int64 = 0
 
 	statsStubForwardCount   int64 =0
 
@@ -40,6 +41,7 @@ type comStats struct {
 	RequestCount int64 `json:"reqCount,omitempty"`
 	ForwardCount int64 `json:"forwardCount,omitempty"`
 	CacheMissCount int64 `json:"cacheMissCount,omitempty"`
+	DataCachedCount int64 `json:"dataCachedCount,omitempty"`
 	CacheSizeUsed int `json:"cacheSizeUsed,omitempty"`
 
 	ErrorCountNoname int64 `json:"noNameCount,omitempty"`
@@ -58,14 +60,16 @@ func (s *server) statsList(w http.ResponseWriter, r *http.Request){
 		return
 	}
 	var sta comStats
-	sta.RequestCount = statsRequestCount
+
 	sta.ForwardCount = statsForwardCount
+	sta.DataCachedCount = statsRequestCountCached
 	sta.CacheMissCount = statsCacheMissResponse
 	sta.CacheSizeUsed = s.rcache.CacheSizeUsed()
-
 	sta.ErrorCountNoname = statsErrorCountNoname
 	sta.ErrorCountOverflow = statsErrorCountOverflow
 	sta.ErrorNoDataCount = statsNoDataCount
+
+	sta.RequestCount = statsRequestCount
 
 	b, err := json.Marshal(sta)
 	if err != nil {
@@ -113,6 +117,49 @@ func (s *server) statsShowCache(w http.ResponseWriter, r *http.Request){
 	}
 	fmt.Fprintf(w, "%s\n",string(b))
 }
+
+func (s *server) domainShowCache(w http.ResponseWriter, r *http.Request){
+        if ! s.statsAuthorization(w,r){
+		return
+	}
+	//udp
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	if !strings.HasSuffix(domain, ".") {
+		domain = fmt.Sprintf("%s.",domain)
+	}
+	msg := s.rcache.ShowCacheDomain(domain,false)
+	if msg == nil{
+		fmt.Fprintf(w, "no found domain: %s\n",domain)
+		return
+	}
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Fprintf(w, "%s\n",err.Error())
+		return
+	}
+	fmt.Fprintf(w, "%s\n",string(b))
+}
+
+func (s *server) domainDeleteCache(w http.ResponseWriter, r *http.Request){
+        if ! s.statsAuthorization(w,r){
+		return
+	}
+	//udp
+	vars := mux.Vars(r)
+	domain := vars["domain"]
+	if !strings.HasSuffix(domain, ".") {
+		domain = fmt.Sprintf("%s.",domain)
+	}
+	ok  := s.rcache.DeleteCacheDomain(domain,false)
+	if ok {
+		fmt.Fprintf(w, "OK\n")
+	}else{
+		fmt.Fprintf(w, "no found domain: %s\n",domain)
+	}
+	return
+}
 func (s *server) Statistics(stAddr string,auth string) {
 	if stAddr ==""{
 		return
@@ -125,6 +172,8 @@ func (s *server) Statistics(stAddr string,auth string) {
 	r := mux.NewRouter()
 	r.HandleFunc("/hades/stats", s.statsList).Methods("GET")
 	r.HandleFunc("/hades/stats/{domain}", s.statsShowCache).Methods("GET")
+	r.HandleFunc("/hades/domain/{domain}", s.domainShowCache).Methods("GET")
+	r.HandleFunc("/hades/domain/{domain}", s.domainDeleteCache).Methods("DELETE")
 
 	glog.Infof("statistics enabled on :%s", stAddr)
 	err = http.ListenAndServe(stAddr, r)

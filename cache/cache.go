@@ -138,6 +138,29 @@ func (c *Cache) ShowCacheStats(domain string,tcp bool) (int64, time.Time){
 		return 0,time.Time{}
 	}
 }
+func (c *Cache) ShowCacheDomain(domain string,tcp bool) (*dns.Msg){
+	//udp
+	c.Lock()
+	defer c.Unlock()
+	key := c.keyTypeA(domain,false,tcp)
+	if e, ok := c.m[key]; ok {
+		return e.msg.Copy()
+	}else{
+		return nil
+	}
+}
+func (c *Cache) DeleteCacheDomain(domain string,tcp bool) bool  {
+	//udp
+	c.Lock()
+	defer c.Unlock()
+	key := c.keyTypeA(domain,false,tcp)
+	if _, ok := c.m[key]; ok {
+		delete(c.m, key)
+		return true
+	}else{
+		return false
+	}
+}
 // the key in cache is diff from domain
 func (c *Cache)keyExtendTypeA(name string, dnssec, tcp bool) string {
 	h := sha1.New()
@@ -152,13 +175,14 @@ func (c *Cache)keyExtendTypeA(name string, dnssec, tcp bool) string {
 	return string(h.Sum(i))
 }
 
-func (c *Cache) checkCacheExitst(r interface{} ) (valueIdx int,keyExist bool,key string){
+func (c *Cache) checkCacheExitst(r interface{} ) (valueIdx int,keyExist bool,valExist bool,key string){
 
 	var nameR string = ""
 	var valA *dns.A = nil
 	var valCname *dns.CNAME = nil
 
 	keyExist = false
+	valExist = false
 	valueIdx = -1
 	key = ""
 	switch r.(type) {
@@ -169,7 +193,7 @@ func (c *Cache) checkCacheExitst(r interface{} ) (valueIdx int,keyExist bool,key
 		valCname = r.(*dns.CNAME)
 		nameR = valCname.Hdr.Name
 	default:
-		return valueIdx,keyExist,key
+		return valueIdx,keyExist,valExist,key
 	}
 	valueIdx = 0
 	key = c.keyTypeA(nameR, false,false)
@@ -177,7 +201,7 @@ func (c *Cache) checkCacheExitst(r interface{} ) (valueIdx int,keyExist bool,key
 		keyExist = true
 		// Cname match specal value -1
 		if valCname != nil{
-			return -1, keyExist,key
+			return -1, keyExist,valExist,key
 		}
 		// type A  match ,we compare the value
 		for _, r := range e.msg.Answer {
@@ -185,14 +209,15 @@ func (c *Cache) checkCacheExitst(r interface{} ) (valueIdx int,keyExist bool,key
 			if b{
 				ret := bytes.Compare(valA.A ,valAnswerA.A)
 				if ret ==0 {
-					return valueIdx, keyExist,key
+					valExist = true
+					return valueIdx, keyExist,valExist,key
 				}
 			}
 			valueIdx += 1
 		}
 	}
 	// the key find but no value use uadateset
-	return valueIdx, keyExist,key
+	return valueIdx, keyExist,valExist,key
 }
 //del the val from the l2 level cache
 func (c *Cache) delValFromDictL2(valA *dns.A ,l2Map map[string][]dns.RR ){
@@ -217,7 +242,7 @@ func (c *Cache) UpdateRcacheSet(val interface{}) {
 	}
 	c.Lock()
 	defer c.Unlock()
-	_, find, matchKey:= c.checkCacheExitst(valA)
+	_, find, _,matchKey:= c.checkCacheExitst(valA)
 	if find{
 		//type A update the  Ansers
 		e := c.m[matchKey]
@@ -237,11 +262,11 @@ func (c *Cache) UpdateRcacheUpdate(valAOld interface{}, valANew interface{} ) {
 	glog.V(2).Infof(" UpdateRcacheUpdate valAOld=%v valANew =%v\n",valAOld,valANew)
 	c.Lock()
 	defer c.Unlock()
-	idx, find, matchKey:= c.checkCacheExitst(valAOld)
+	idx, find, valExist,matchKey:= c.checkCacheExitst(valAOld)
 	//glog.Infof(" UpdateRcacheSet find =%v matchKey =%v \n",find,matchKey)
 	if find{
 		// cname match we del the key and return
-		if idx < 0{
+		if ! valExist {
 			delete(c.m, matchKey)
 			return
 		}
@@ -258,11 +283,11 @@ func (c *Cache) UpdateRcacheDelete(valA interface{}) {
 	glog.V(2).Infof(" UpdateRcacheDelete =%v\n",valA)
 	c.Lock()
 	defer c.Unlock()
-	idx, find,matchKey := c.checkCacheExitst(valA)
+	idx, find,valExist,matchKey := c.checkCacheExitst(valA)
 	//glog.Infof(" UpdateRcacheSet find =%v matchKey =%v \n",find,matchKey)
 	if find{
 		// cname match we del the key and return
-		if idx < 0{
+		if !valExist{
 			delete(c.m, matchKey)
 			return
 		}

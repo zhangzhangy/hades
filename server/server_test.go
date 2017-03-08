@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
 	"github.com/miekg/dns"
 	backendetcd "github.com/ipdcode/hades/backends/etcd"
 	"github.com/ipdcode/hades/cache"

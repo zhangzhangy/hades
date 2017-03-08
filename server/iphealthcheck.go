@@ -4,7 +4,7 @@ import (
 	"strings"
 	"encoding/json"
 	"time"
-        "github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
 	"github.com/golang/glog"
 )
 
@@ -13,39 +13,45 @@ type apiHadesIpMonitor struct {
 	Ports         []string  `json:"ports,omitempty"`
 }
 
-func (s *server) SyncHadesHostStatus() {
+func (s *server) SyncHadesHostStatus( ) uint64{
         // get hosts form /hades/monitor/status/
+
 	monitorIps := make(map[string]bool)
 	r, err1 := s.backend.Get(s.ipMonitorPath)
+	var record apiHadesIpMonitor
+
 	if err1 != nil{
 		retStr := err1.Error()
 		// if key not fond, keep going
 		if !strings.HasPrefix(retStr,"100: Key not found"){
 			glog.Infof("Err: %s\n",err1.Error())
-			return
+			return 0
 		}
 	}
-	if err1 == nil{
-		for _, n := range r.Node.Nodes{
-			if n.Dir {
-				continue
-			}
-			//chck val
-			var record apiHadesIpMonitor
-			if err := json.Unmarshal([]byte(n.Value), &record); err != nil {
-				glog.Infof("Err: %s\n",err.Error())
-				return
-			}
-			if record.Status == "UP"{
-				ip := n.Key[len(s.ipMonitorPath):]
-				monitorIps[ip] = true
-			}
+	watchIdx := r.Index
 
+	for _, n := range r.Node.Nodes{
+		if n.Dir {
+			continue
 		}
-		s.rcache.Lock()
-		s.rcache.AvaliableIps = monitorIps
-		s.rcache.Unlock()
+		//chck val
+
+		if err := json.Unmarshal([]byte(n.Value), &record); err != nil {
+			glog.Infof("Err: %s\n",err.Error())
+			return 0
+		}
+		if record.Status == "UP"{
+			ip := n.Key[len(s.ipMonitorPath):]
+			monitorIps[ip] = true
+		}
+
 	}
+	glog.Infof("len of ip monitirs =%d\n",len(monitorIps))
+	s.rcache.Lock()
+	s.rcache.AvaliableIps = monitorIps
+	s.rcache.Unlock()
+
+	return watchIdx
 }
 
 func (s *server) doUpdateHostStatus(resp *etcd.Response) {
