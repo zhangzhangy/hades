@@ -8,7 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
+	"golang.org/x/net/context"
 	"github.com/ipdcode/hades/msg"
 )
 
@@ -20,15 +21,17 @@ type Config struct {
 }
 
 type Backend struct {
-	client   *etcd.Client
+	client   etcd.KeysAPI
+	ctx      context.Context
 	config   *Config
 	singleInflight *etcdSingle
 }
 
 // NewBackend returns a new Backend for HADES, backed by etcd.
-func NewBackend(client *etcd.Client, config *Config) *Backend {
+func NewBackend(client etcd.KeysAPI, ctx context.Context, config *Config) *Backend {
 	return &Backend{
 		client:   client,
+		ctx:      ctx,
 		config:   config,
 		singleInflight: new(etcdSingle),
 	}
@@ -91,16 +94,15 @@ func (g *Backend) ReverseRecord(name string) (*msg.Service, error) {
 // outstanding queries.
 func (g *Backend) get(path string, recursive bool) (*etcd.Response, error) {
 	resp, err, _ := g.singleInflight.Do(path, func() (*etcd.Response, error) {
-		r, e := g.client.Get(path, true, recursive)
+		r, e := g.client.Get(g.ctx, path, &etcd.GetOptions{Sort: true, Recursive: recursive})
 		if e != nil {
 			return nil, e
 		}
 		return r, e
 	})
 	if err != nil {
-		return resp, err
+		return nil, err
 	}
-	// shared?
 	return resp, err
 }
 
@@ -185,7 +187,7 @@ func (g *Backend) calculateTtl(node *etcd.Node, serv *msg.Service) uint32 {
 }
 
 // Client exposes the underlying Etcd client.
-func (g *Backend) Client() *etcd.Client {
+func (g *Backend) Client() etcd.KeysAPI{
 	return g.client
 }
 

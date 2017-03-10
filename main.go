@@ -7,21 +7,20 @@ import (
 
 	"flag"
 	"fmt"
-	"math/rand"
 	"net"
 	"strconv"
 	"strings"
 	"time"
-	"github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
 	backendetcd "github.com/ipdcode/hades/backends/etcd"
 	"github.com/ipdcode/hades/msg"
 	"github.com/ipdcode/hades/server"
 	"github.com/golang/glog"
+	"golang.org/x/net/context"
 )
 
 const (
 	glogFlushPeriod       = 5 * time.Second
-	syncIpStatusPeriod    = 60 * time.Second
 )
 var (
 	tlskey     = ""
@@ -75,7 +74,11 @@ func main() {
 	defer glog.Flush()
 
 	machines := strings.Split(machine, ",")
-	client := newEtcdClient(machines, tlspem, tlskey, cacert)
+	clientv2,err := newEtcdClient(machines)
+
+	if err != nil {
+		glog.Fatalf("hades:newEtcdClient: %s", err)
+	}
 
 	if nameserver != "" {
 		for _, hostPort := range strings.Split(nameserver, ",") {
@@ -96,63 +99,61 @@ func main() {
 		glog.Fatalf("hades: ipHold and radom-one you must chose one or neither, check config file !! \n")
 	}
 
-	backend := backendetcd.NewBackend(client, &backendetcd.Config{
+	var ctx        = context.Background()
+
+	backend := backendetcd.NewBackend(clientv2, ctx, &backendetcd.Config{
 		Ttl:      config.Ttl,
 		Priority: config.Priority,
 	})
 	s := server.New(backend, config)
 
+		 // watch ip status
 	go func() {
-		recv := make(chan *etcd.Response)
-		go client.Watch(msg.Path(config.Domain), 0, true, recv, nil)
+		var watcher etcd.Watcher
 		duration := 1 * time.Second
+		watcher = clientv2.Watcher(msg.Path(config.Domain), &etcd.WatcherOptions{AfterIndex: 0, Recursive: true})
 		for {
-			select {
-			case n := <-recv:
-				if n != nil {
-					s.UpdateRcache(n)
-					duration = 1 * time.Second // reset
-				} else {
-
-					glog.Infof("hades: etcd machine cluster update failed, sleeping %s + ~3s", duration)
-					time.Sleep(duration + (time.Duration(rand.Float32() * 3e9))) // Add some random.
-					duration *= 2
-					if duration > 32*time.Second {
-						duration = 32 * time.Second
-					}
+			r, err := watcher.Next(ctx)
+		        if err != nil {
+				glog.Infof("hades: watch ips sleeping %s ", duration)
+				time.Sleep(duration)
+				duration *= 2
+				if duration > 32*time.Second {
+					duration = 32 * time.Second
 				}
+
+			}else {
+				s.UpdateRcache(r)
+				duration = 1 * time.Second // reset
 			}
+
 		}
 	}()
 
-
-        // watch ip status
-	go func() {
-		recv := make(chan *etcd.Response)
-		go client.Watch(config.IpMonitorPath, 0, true, recv, nil)
-		duration := 1 * time.Second
-		for {
-			select {
-			case n := <-recv:
-				if n != nil {
-					s.UpdateHostStatus(n)
-					duration = 1 * time.Second // reset
-				} else {
-
-					glog.Infof("hades: etcd machine cluster update failed, sleeping %s + ~3s", duration)
-					time.Sleep(duration + (time.Duration(rand.Float32() * 3e9))) // Add some random.
-					duration *= 2
-					if duration > 32*time.Second {
-						duration = 32 * time.Second
-					}
-				}
-			}
-		}
-	}()
 	// before server run we get the active ips
-	s.SyncHadesHostStatus()
+	ipWatchIdx := s.SyncHadesHostStatus()
+	 // watch ip status
+	go func() {
+		var watcher etcd.Watcher
+		duration := 1 * time.Second
+		watcher = clientv2.Watcher(config.IpMonitorPath, &etcd.WatcherOptions{AfterIndex: ipWatchIdx, Recursive: true})
+		for {
+			r, err := watcher.Next(ctx)
+		        if err != nil {
+				glog.Infof("hades: watch ips sleeping %s ", duration)
+				time.Sleep(duration)
+				duration *= 2
+				if duration > 32*time.Second {
+					duration = 32 * time.Second
+				}
+			}else {
+				s.UpdateHostStatus(r)
+				duration = 1 * time.Second // reset
+			}
 
-	go s.HostStatusSync(syncIpStatusPeriod)
+		}
+	}()
+
 
 	go s.Statistics(statsServer,statsServerAuthToken) //
 
@@ -176,18 +177,13 @@ func validateHostPort(hostPort string) error {
 	return nil
 }
 
-func newEtcdClient(machines []string, tlsCert, tlsKey, tlsCACert string) (client *etcd.Client) {
-	// set default if not specified in env
-	if len(machines) == 1 && machines[0] == "" {
-		machines[0] = "http://127.0.0.1:4001"
+func newEtcdClient(machines []string) (etcd.KeysAPI, error) {
+	cli, err := etcd.New(etcd.Config{
+		Endpoints: machines,
+	})
+	if err != nil {
+		return nil, err
 	}
-	if strings.HasPrefix(machines[0], "https://") {
-		var err error
-		if client, err = etcd.NewTLSClient(machines, tlsCert, tlsKey, tlsCACert); err != nil {
-			glog.Fatalf("hades: failure to connect: %s", err)
-		}
-		return client
-	}
-	return etcd.NewClient(machines)
+	return etcd.NewKeysAPI(cli), nil
 }
 

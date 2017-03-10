@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"net"
 	"strings"
+	"time"
 	hadesmsg "github.com/ipdcode/hades/msg"
 	etcd "github.com/coreos/etcd/client"
 	"github.com/golang/glog"
@@ -28,6 +29,7 @@ const (
 	errDeleteK8sSvc = "ERR, can not del k8s svc "
 	errSetDomainName    = "ERR, set domain name error "
 	errSetDomainNameExists    = "ERR, set domain name error  domain exists "
+	errPutTooManyItems   = "ERR, put just support  one update one time"
 	errSetAliasNameExists    = "ERR, set domain name error  alias exists "
 	noFindAliasName    = "ERR, not find   alias name "
 	noMatchAliasName    = "ERR, alias name and domain not match "
@@ -60,6 +62,7 @@ type apiService struct {
 type apiHadesRecord struct {
 	Host    string `json:"host,omitempty"`
 	Dnstype string  `json:"type,omitempty"`
+	Ttl      uint32 `json:"ttl,omitempty"`
 	Mail    bool `json:"mail,omitempty"`
 	MailPriority int  `json:"priority,omitempty"`
 
@@ -103,16 +106,18 @@ func (a *hadesApi)buildDNSNameString(labels ...string) string {
 func (a *hadesApi) setHadesRecordHost(name string, ipaddr string,dnsType string) string {
         var svc apiHadesRecord
 	svc.Host = ipaddr
+	svc.Ttl  = 30
 	svc.Dnstype = dnsType
 	b, err := json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errSetDomainName
 	}
 	recordValue := string(b)
 	glog.V(2).Infof("setHadesRecordHost:%s",hadesmsg.Path(name))
 
 	err = a.etcdClient.Set(hadesmsg.Path(name), recordValue)
+	time.Sleep(20*time.Microsecond)
 
 	if err != nil {
 		retStr := err.Error()
@@ -135,7 +140,7 @@ func (a *hadesApi) setHadesRecordMail(name string, host string,priority int ,dns
 	svc.MailPriority = priority
 	b, err := json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errSetDomainName
 	}
 	recordValue := string(b)
@@ -163,7 +168,7 @@ func (a *hadesApi) setHadesRecordText(name string, text string,dnsType string) s
 
 	b, err := json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errSetDomainName
 	}
 	recordValue := string(b)
@@ -190,7 +195,7 @@ func (a *hadesApi) updateHadesRecord(name string, preVal string,newVal string, d
 	svc.Dnstype = dnsType
 	b, err := json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errUpdateDomainName
 	}
 	recordPre := string(b)
@@ -199,7 +204,7 @@ func (a *hadesApi) updateHadesRecord(name string, preVal string,newVal string, d
 	svc.Dnstype = dnsType
 	b, err = json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errUpdateDomainName
 	}
 	recordNew := string(b)
@@ -209,7 +214,7 @@ func (a *hadesApi) updateHadesRecord(name string, preVal string,newVal string, d
 	err = a.etcdClient.Update(hadesmsg.Path(name), recordNew, recordPre, true)
 
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errUpdateDomainName
 	}else{
 		return apiSucess
@@ -218,15 +223,17 @@ func (a *hadesApi) updateHadesRecord(name string, preVal string,newVal string, d
 func (a *hadesApi) deleteHadesRecord(name string,) string {
 	res, err := a.etcdClient.Get(hadesmsg.Path(name), false, true)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return noFindDomainName
 	}
 	glog.V(2).Infof("deleteHadesRecord :%s",hadesmsg.Path(name))
 
 	err = a.etcdClient.Delete(res)
+	time.Sleep(20*time.Microsecond)
+
 
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		return errDeleteDomainName
 	}
 	return apiSucess
@@ -246,6 +253,7 @@ func (a *hadesApi) deleteIpMonitorRecord(ip string,) error {
 	glog.V(2).Infof("deleteIpMonitorRecord :%s",key)
 
 	err = a.etcdClient.Delete(res)
+	time.Sleep(20*time.Microsecond)
 	return err
 }
 
@@ -270,6 +278,7 @@ func (a *hadesApi)  writeIpMonitorRecord(ip string) error {
 	if strings.HasPrefix(err.Error(), etcdKeyNotFound){
 		err = a.etcdClient.Set(key, recordValue)
 	}
+	time.Sleep(20*time.Microsecond)
 
 	return err
 }
@@ -422,6 +431,13 @@ func (a *hadesApi)processTypeADelete(s *apiService,domain string )string{
 		ret = a.deleteHadesRecord(name)
 		return ret
 	}
+	name = a.buildDNSNameString(a.domain,domain)
+	_, err := a.etcdClient.Get(hadesmsg.Path(name), false, true)
+	if err != nil {
+		glog.Infof("%s\n", err.Error())
+		return noFindDomainName
+	}
+
 	for _, ipaddr := range s.DomainIps{
 		ip := net.ParseIP(ipaddr)
 		switch {
@@ -431,7 +447,7 @@ func (a *hadesApi)processTypeADelete(s *apiService,domain string )string{
 			name = a.buildDNSNameString(a.domain,domain,a.getHashIp(ipaddr))
 			ret = a.deleteHadesRecord(name)
 			if ret != apiSucess{
-				return ret
+				return noFindDomainIp
 			}
 			a.deleteIpMonitorRecord(ipaddr)
 
@@ -451,6 +467,9 @@ func (a *hadesApi)processTypeADelete(s *apiService,domain string )string{
 }
 
 func (a *hadesApi )processTypeAPut(s *apiService, domain string)string {
+	if len(s.UpdateMap) != 1{
+		return errPutTooManyItems
+	}
 	for key, val := range s.UpdateMap {
 		ipPre := net.ParseIP(key)
 		ipNew := net.ParseIP(val)
@@ -500,6 +519,9 @@ func (a *hadesApi )processTypeAPut(s *apiService, domain string)string {
 
 
 func (a *hadesApi )processTypeCnamePut(s *apiService, domain string)string {
+	if len(s.UpdateMap) != 1{
+		return errPutTooManyItems
+	}
 	for key, val := range s.UpdateMap {
 		// check key exist
 		name := a.buildDNSNameString(a.domain, key)
@@ -739,14 +761,14 @@ func (a *hadesApi)processGet(w http.ResponseWriter, r *http.Request){
 	err := a.getHadesRecords(domain,"A", svc)
 
 	if len(svc) == 0 && err != nil{
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		fmt.Fprintf(w, "%s\n",noFindDomainName)
 		return
 	}
 
 	b, err := json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		fmt.Fprintf(w, "%s\n",errGetDomainName)
 		return
 	}
@@ -765,14 +787,14 @@ func (a *hadesApi)processGetAll(w http.ResponseWriter, r *http.Request){
 	err := a.getHadesRecords("",s.OpsType, svc)
 
 	if len(svc) == 0 && err != nil{
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		fmt.Fprintf(w, "%s\n",errGetDomainName)
 		return
 	}
 
 	b, err := json.Marshal(svc)
 	if err != nil {
-		glog.Errorf("%s\n", err.Error())
+		glog.Infof("%s\n", err.Error())
 		fmt.Fprintf(w, "%s\n",errGetDomainName)
 		return
 	}

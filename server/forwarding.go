@@ -10,11 +10,12 @@ import (
 	"github.com/golang/glog"
 	"github.com/miekg/dns"
 	"github.com/ipdcode/hades/cache"
+	"sync/atomic"
 )
 
 // ServeDNSForward forwards a request to a nameservers and returns the response.
 func (s *server) ServeDNSForward(w dns.ResponseWriter, req *dns.Msg,remoteIp string, timeNow time.Time) *dns.Msg {
-	statsForwardCount++
+	atomic.AddInt64(&statsForwardCount,1)
 	tcp := isTCP(w)
 	if len(s.config.Nameservers) == 0 || dns.CountLabel(req.Question[0].Name) < s.config.Ndots {
 

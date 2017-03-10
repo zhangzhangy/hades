@@ -10,14 +10,14 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/coreos/go-etcd/etcd"
+	etcd "github.com/coreos/etcd/client"
 	"github.com/miekg/dns"
 	"github.com/ipdcode/hades/cache"
 	"github.com/ipdcode/hades/msg"
 	"github.com/golang/glog"
 	"fmt"
 	"math"
+	"sync/atomic"
 )
 
 const Version = "1.1.2"
@@ -305,7 +305,6 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	q := req.Question[0]
 	name := strings.ToLower(q.Name)
-
 	if q.Qtype == dns.TypeANY {
 		m.Authoritative = false
 		m.Rcode = dns.RcodeRefused
@@ -315,7 +314,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		// if write fails don't care
 		w.WriteMsg(m)
 
-		statsErrorCountRefused ++
+		atomic.AddInt64(&statsErrorCountRefused,1)
 		return
 	}
 
@@ -325,13 +324,11 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// with TCP we can send 64K
 	if tcp = isTCP(w); tcp {
 		bufsize = dns.MaxMsgSize - 1
-		statsRequestCountTcp++
+		atomic.AddInt64(&statsRequestCountTcp, 1)
 	} else {
-		statsRequestCountUdp++
+		atomic.AddInt64(&statsRequestCountUdp,1)
 	}
-
-	statsRequestCount++
-
+ 	atomic.AddInt64(&statsRequestCount,1)
 
 	glog.V(2).Infof("received DNS Request for %q from %q with type %d", q.Name, w.RemoteAddr(), q.Qtype)
 
@@ -340,10 +337,11 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	remoteIp := strings.Split(remoteAddr, ":")
 	m1 := s.rcache.Search(q, tcp, m.Id,remoteIp[0],timeNow)
 	if m1 != nil {
+		atomic.AddInt64(&statsRequestCountCached,1)
 		glog.V(4).Infof("cache hit %q: %v\n ", q.Name,m1.Answer)
 		if tcp {
 			if _, overflow := Fit(m1, dns.MaxMsgSize, tcp); overflow {
-				statsErrorCountOverflow ++
+				atomic.AddInt64(&statsErrorCountOverflow,1)
 				msgFail := new(dns.Msg)
 				s.ServerFailure(msgFail, req)
 				w.WriteMsg(msgFail)
@@ -353,7 +351,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			// Overflow with udp always results in TC.
 			Fit(m1, int(bufsize), tcp)
 			if m1.Truncated {
-				statsErrorCountTruncated++
+				atomic.AddInt64(&statsErrorCountTruncated,1)
 			}
 		}
 		if err := w.WriteMsg(m1); err != nil {
@@ -372,7 +370,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		glog.V(4).Infof("ServeDNSForward %q: %v \n ", q.Name, resp.Answer)
 		return
 	}
-        statsCacheMissResponse++
+        atomic.AddInt64(&statsCacheMissResponse,1)
 
 	defer func() {
 		if m.Rcode == dns.RcodeServerFailure {
@@ -406,7 +404,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		} else {
 			Fit(m, int(bufsize), tcp)
 			if m.Truncated {
-				statsErrorCountTruncated++
+				atomic.AddInt64(&statsErrorCountTruncated,1)
 			}
 		}
 		s.rcache.InsertMessage(cache.Key(q, tcp), m,remoteIp[0],timeNow,false)
@@ -538,10 +536,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 				return
 			}
 		}
-		// if we are here again, check the types, because an answer may only
-		// be given for SRV. All other types should return NODATA, the
-		// NXDOMAIN part is handled in the above code.
-		// can be done in a more elegant manor.
+
 		if q.Qtype == dns.TypeSRV {
 			m.Answer = append(m.Answer, records...)
 			m.Extra = append(m.Extra, extra...)
@@ -549,7 +544,7 @@ func (s *server) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	if len(m.Answer) == 0 { // NODATA response
-		statsNoDataCount++
+		atomic.AddInt64(&statsNoDataCount,1)
 		m.Ns = []dns.RR{s.NewSOA()}
 		m.Ns[0].Header().Ttl = s.config.MinTtl
 	}
@@ -896,20 +891,20 @@ func (s *server) NameError(m, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeNameError)
 	m.Ns = []dns.RR{s.NewSOA()}
 	m.Ns[0].Header().Ttl = s.config.MinTtl
-	statsErrorCountNoname++
+	atomic.AddInt64(&statsErrorCountNoname,1)
 }
 
 func (s *server) NoDataError(m, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeSuccess)
 	m.Ns = []dns.RR{s.NewSOA()}
 	m.Ns[0].Header().Ttl = s.config.MinTtl
-	statsNoDataCount++
+	atomic.AddInt64(&statsNoDataCount,1)
 
 }
 
 func (s *server) ServerFailure(m, req *dns.Msg) {
 	m.SetRcode(req, dns.RcodeServerFailure)
-	statsErrorCountServfail++
+	atomic.AddInt64(&statsErrorCountServfail,1)
 }
 
 func (s *server) dedup(m *dns.Msg) *dns.Msg {
@@ -976,13 +971,9 @@ func isTCP(w dns.ResponseWriter) bool {
 	return ok
 }
 
-// etcNameError return a NameError to the client if the error
-// returned from etcd has ErrorCode == 100.
 func isEtcdNameError(err error, s *server) bool {
-	if e, ok := err.(*etcd.EtcdError); ok {
-		if e.ErrorCode == 100 {
-			return true
-		}
+	if e, ok := err.(etcd.Error); ok && e.Code == etcd.ErrorCodeKeyNotFound {
+		return true
 	}
 	if err != nil {
 		glog.Infof("error from backend: %s", err)
